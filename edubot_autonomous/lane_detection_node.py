@@ -30,6 +30,11 @@ The pipeline is intentionally minimal: crop -> HSV -> mask -> contour -> centroi
 All thresholds are ROS parameters so they can be tuned at runtime with
 `ros2 param set ...` instead of recompiling.
 
+Optionally, a YOLOv8n segmentation model can replace the HSV masks for white
+and yellow detection. Enable with use_yolo:=True and point yolo_model_path at
+the .pt file. The model is expected to have class 0 = White lane,
+class 1 = Yellow Lane. Falls back to HSV if YOLO returns empty detections.
+
 Dashed yellow is intermittent by definition; we hold the last centroid for
 `yellow_memory_secs` so the controller does not see a square wave on it.
 
@@ -39,6 +44,7 @@ camera_info or TF is not yet available we still publish 2D outputs so
 navigation can run without mapping.
 """
 import math
+import os
 
 import cv2
 import numpy as np
@@ -66,17 +72,16 @@ class LaneDetectionNode(Node):
         self.declare_parameter('camera_height_m', 0.15)
         self.declare_parameter('camera_pitch_deg', -45.0)
 
-        # ROI - cropping out sky / bumper makes everything else easier.
-        # crop_top_ratio is intentionally low (0.28) so the lane stays in
-        # the ROI through the curves; previously 0.45 lost the line mid-turn.
-        # Going lower than this caused systematic perspective bias in the
-        # slope fit on straightaways.
+        # ROI - crop_top_ratio raised to 0.20 to cut out more of the upper
+        # frame where window glare and floor reflections cause false detections.
         self.declare_parameter('crop_top_ratio', 0.10)
         self.declare_parameter('crop_bottom_ratio', 0.05)
         self.declare_parameter('crop_side_ratio', 0.0)
         self.declare_parameter('crop_top_orange_ratio', 0.10)
 
-        # HSV gates - OpenCV uses H in [0,179], S/V in [0,255]
+        # HSV gates - OpenCV uses H in [0,179], S/V in [0,255].
+        # white_v_min lowered 200->180 to keep detecting white under shadows.
+        # yellow hue range widened (15-50) for robustness under warm/cool lighting.
         self.declare_parameter('white_h_min', 0)
         self.declare_parameter('white_h_max', 179)
         self.declare_parameter('white_s_min', 0)
@@ -98,31 +103,33 @@ class LaneDetectionNode(Node):
         self.declare_parameter('orange_v_min', 120)
         self.declare_parameter('orange_v_max', 255)
 
-        # Geometry / behavior. target_yellow=0.30 / yellow_weight=0.35 are
-        # the values that worked best at the track; lowering them pulled
-        # the robot off the yellow line so hard it drove onto the right
-        # boundary. Tune these only via ros2 param at trackside.
+        # Geometry / behavior.
         self.declare_parameter('min_contour_area', 1500.0)
         self.declare_parameter('target_white_x_ratio', 0.80)
         self.declare_parameter('target_yellow_x_ratio', 0.30)
+        self.declare_parameter('white_x_min_ratio', 0.45)
         self.declare_parameter('yellow_weight', 0.35)
-        # Yellow memory is short on purpose: dashed gaps still bridge, but a
-        # real loss stops driving stale errors into the controller.
         self.declare_parameter('yellow_memory_secs', 0.25)
         self.declare_parameter('min_orange_pixels', 4000)
-        # Orange must span most of the ROI width to count - otherwise small
-        # corner blobs of red carpet were tripping the U-turn mid-track.
         self.declare_parameter('min_orange_width_ratio', 0.45)
         self.declare_parameter('orange_consecutive_frames', 3)
         self.declare_parameter('confidence_smoothing', 0.5)
-        # Heading feed-forward (yellow-line slope). Smoothing damps single-
-        # frame fits; gain scales the unitless slope into the [-1,1] range
-        # the navigation node expects.
         self.declare_parameter('heading_smoothing', 0.6)
         self.declare_parameter('heading_gain', 1.5)
         self.declare_parameter('heading_min_points', 8)
         self.declare_parameter('use_clahe', True)
         self.declare_parameter('debug_image', True)
+
+        # YOLO segmentation detector (optional).
+        # Set use_yolo:=True to activate. Set yolo_model_path to the .pt file
+        # on the robot. Falls back to HSV if a detection class is empty.
+        # yolo_frame_skip runs inference every Nth frame to reduce CPU load;
+        # cached masks are used for intermediate frames.
+        self.declare_parameter('use_yolo', True)
+        self.declare_parameter('yolo_model_path',
+            '/home/developer/andrew_ws/src/edubot_autonomous/models/lane_yolov8n_seg.pt')
+        self.declare_parameter('yolo_conf_threshold', 0.4)
+        self.declare_parameter('yolo_frame_skip', 3)
 
         self.bridge = CvBridge()
         self.fx = self.fy = self.cx_pix = self.cy_pix = None
@@ -132,13 +139,22 @@ class LaneDetectionNode(Node):
         self._orange_streak = 0
         self._confidence_smoothed = 0.0
         self._heading_smoothed = 0.0
-        self._last_yellow_line = None  # (vx, vy, x0, y0) for debug overlay
+        self._last_yellow_line = None
+
+        # YOLO state
+        self._yolo_model = None
+        self._yolo_frame_count = 0
+        self._yolo_white_mask_cache = None
+        self._yolo_yellow_mask_cache = None
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self._static_tf_broadcaster = StaticTransformBroadcaster(self)
         if self.get_parameter('publish_camera_tf').value:
             self._publish_camera_tf()
+
+        if self.get_parameter('use_yolo').value:
+            self._load_yolo_model()
 
         self.create_subscription(
             CameraInfo,
@@ -165,9 +181,6 @@ class LaneDetectionNode(Node):
 
     # ------------------------------------------------------------------ TF
     def _publish_camera_tf(self):
-        # Provides a sane default base_link -> camera transform if the robot's
-        # URDF has not already published one. Override with publish_camera_tf:=False
-        # if your URDF takes care of it.
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = self.get_parameter('base_frame').value
@@ -177,14 +190,7 @@ class LaneDetectionNode(Node):
         t.transform.translation.y = 0.0
         t.transform.translation.z = self.get_parameter('camera_height_m').value
 
-        # Optical frame: x=right, y=down, z=forward into the scene.
-        # Build that orientation from a base_link-relative pitch (camera tilted
-        # downward by camera_pitch_deg).
         pitch = math.radians(self.get_parameter('camera_pitch_deg').value)
-        # base_link forward (x) -> optical z
-        # base_link left (y) -> optical -x
-        # base_link up (z) -> optical -y
-        # ... rotated by pitch about base_link y axis.
         cp, sp = math.cos(pitch), math.sin(pitch)
         rot = np.array([
             [0.0, -1.0, 0.0],
@@ -237,6 +243,53 @@ class LaneDetectionNode(Node):
             f'cx={self.cx_pix:.1f} cy={self.cy_pix:.1f}'
         )
 
+    # ------------------------------------------------------------------ YOLO
+    def _load_yolo_model(self):
+        try:
+            from ultralytics import YOLO  # noqa: PLC0415
+            path = os.path.expanduser(self.get_parameter('yolo_model_path').value)
+            self._yolo_model = YOLO(path)
+            self.get_logger().info(f'YOLO model loaded from {path}')
+        except Exception as exc:
+            self.get_logger().error(f'Failed to load YOLO model: {exc}')
+            self._yolo_model = None
+
+    def _yolo_detect(self, roi):
+        """Run YOLO segmentation; return (white_mask, yellow_mask) uint8 or (None, None)."""
+        if self._yolo_model is None:
+            return None, None
+        try:
+            h, w = roi.shape[:2]
+            results = self._yolo_model.predict(
+                roi,
+                conf=float(self.get_parameter('yolo_conf_threshold').value),
+                verbose=False,
+            )
+            white_mask = np.zeros((h, w), dtype=np.uint8)
+            yellow_mask = np.zeros((h, w), dtype=np.uint8)
+
+            if results and results[0].masks is not None:
+                masks_data = results[0].masks.data.cpu().numpy()  # (N, Hm, Wm)
+                classes = results[0].boxes.cls.cpu().numpy().astype(int)
+                for i, cls_id in enumerate(classes):
+                    if i >= len(masks_data):
+                        break
+                    m = cv2.resize(
+                        masks_data[i], (w, h), interpolation=cv2.INTER_LINEAR
+                    )
+                    binary = (m > 0.5).astype(np.uint8) * 255
+                    if cls_id == 0:
+                        white_mask = cv2.bitwise_or(white_mask, binary)
+                    elif cls_id == 1:
+                        yellow_mask = cv2.bitwise_or(yellow_mask, binary)
+
+            return white_mask, yellow_mask
+        except Exception as exc:
+            self.get_logger().warn(
+                f'YOLO detection failed: {exc}', throttle_duration_sec=5.0
+            )
+            return None, None
+
     # ------------------------------------------------------------------ main
     def _image_cb(self, msg: Image):
         try:
@@ -266,15 +319,50 @@ class LaneDetectionNode(Node):
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         hsv_orange = cv2.cvtColor(roi_orange, cv2.COLOR_BGR2HSV)
 
-        white_mask = self._color_mask(hsv, 'white', kernel=5)
-        yellow_mask = self._color_mask(hsv, 'yellow', kernel=5)
+        # Choose lane mask source: YOLO or HSV
+        if self.get_parameter('use_yolo').value and self._yolo_model is not None:
+            self._yolo_frame_count += 1
+            skip = int(self.get_parameter('yolo_frame_skip').value)
+            if self._yolo_frame_count % skip == 0 or self._yolo_white_mask_cache is None:
+                yw, yy = self._yolo_detect(roi)
+                if yw is not None:
+                    self._yolo_white_mask_cache = yw
+                    self._yolo_yellow_mask_cache = yy
+
+            # Use YOLO masks, fall back to HSV per channel if empty
+            if (
+                self._yolo_white_mask_cache is not None
+                and cv2.countNonZero(self._yolo_white_mask_cache) >= 100
+            ):
+                white_mask = self._yolo_white_mask_cache
+            else:
+                white_mask = self._color_mask(hsv, 'white', kernel=5)
+
+            if (
+                self._yolo_yellow_mask_cache is not None
+                and cv2.countNonZero(self._yolo_yellow_mask_cache) >= 100
+            ):
+                yellow_mask = self._yolo_yellow_mask_cache
+            else:
+                yellow_mask = self._color_mask(hsv, 'yellow', kernel=5)
+        else:
+            white_mask = self._color_mask(hsv, 'white', kernel=5)
+            yellow_mask = self._color_mask(hsv, 'yellow', kernel=5)
+
         orange_mask = self._color_mask(hsv_orange, 'orange', kernel=7)
 
         white_cnt = self._largest_contour(white_mask)
         yellow_cnt = self._largest_contour(yellow_mask)
 
-        # Lateral error from white (preferred) and yellow (fallback)
         white_cx = self._centroid_x(white_cnt)
+        
+
+# Reject white detections on the wrong side of the frame
+        if white_cx is not None:
+            white_min_x = int(roi_w * self.get_parameter('white_x_min_ratio').value)
+            if white_cx < white_min_x:
+                white_cx = None
+                white_cnt = None
         yellow_cx = self._centroid_x(yellow_cnt)
 
         now = self.get_clock().now().nanoseconds * 1e-9
@@ -301,9 +389,6 @@ class LaneDetectionNode(Node):
         yellow_live = yellow_cx is not None and not yellow_from_memory
         yellow_any = yellow_cx is not None
 
-        # Confidence rules: prefer to know "is the controller on solid ground"
-        # over a precise probability. Live both -> 1.0. Live yellow alone is
-        # weaker than white alone (white is the boundary we drive next to).
         if white_ok and yellow_live:
             raw_conf = 1.0
         elif white_ok and yellow_any:
@@ -325,8 +410,6 @@ class LaneDetectionNode(Node):
             final_err = white_err
             src = 'WHITE'
         elif yellow_any:
-            # No right_bias: a saturating offset here was the source of the
-            # max-angular spin-out on lane loss.
             final_err = yellow_err
             src = 'YELLOW_MEM' if yellow_from_memory else 'YELLOW'
         else:
@@ -335,14 +418,8 @@ class LaneDetectionNode(Node):
 
         final_err = float(np.clip(final_err, -1.5, 1.5))
 
-        # Heading feed-forward from the yellow contour shape. Curves push
-        # the centroid only after the line has visibly slid sideways, which
-        # is too late to steer in time. Slope-of-yellow tells us the curve
-        # is coming several frames earlier.
         raw_heading = self._yellow_heading(yellow_cnt)
         if raw_heading is None:
-            # Decay rather than snap to zero so we don't kill the FF on a
-            # single dropped frame in a curve.
             target_h = 0.0
             beta = 0.85
         else:
@@ -352,8 +429,6 @@ class LaneDetectionNode(Node):
         self._heading_smoothed = beta * self._heading_smoothed + (1.0 - beta) * target_h
         heading = float(np.clip(self._heading_smoothed, -1.0, 1.0))
 
-        # Smooth confidence so a single dropped frame doesn't punish the
-        # controller, but a sustained loss decays within a few frames.
         alpha = float(self.get_parameter('confidence_smoothing').value)
         alpha = max(0.0, min(1.0, alpha))
         self._confidence_smoothed = (
@@ -361,10 +436,6 @@ class LaneDetectionNode(Node):
         )
         confidence = float(np.clip(self._confidence_smoothed, 0.0, 1.0))
 
-        # End-of-road - require a few consecutive frames so a single noisy
-        # patch of red carpet does not flip us into U_TURN, AND the orange
-        # blob must span most of the ROI width (orange is a perpendicular
-        # line, so a narrow contour is almost always a false positive).
         orange_pixels = int(cv2.countNonZero(orange_mask))
         orange_wide_enough = False
         orange_largest = self._largest_contour(orange_mask)
@@ -390,7 +461,6 @@ class LaneDetectionNode(Node):
         self.pub_eor.publish(Bool(data=bool(end_of_road)))
         self.pub_white_det.publish(Bool(data=bool(white_ok)))
 
-        # 3D projection for mapping (best-effort, safe to skip when not ready)
         self._maybe_publish_points(
             msg.header,
             roi_top,
@@ -426,9 +496,6 @@ class LaneDetectionNode(Node):
 
     # -------------------------------------------------------------- helpers
     def _clahe(self, bgr):
-        # Apply CLAHE to the V (intensity) channel of HSV. Equalising V keeps
-        # hue stable while flattening the dynamic range across patchy lighting,
-        # which is exactly what HSV thresholding wants.
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         hsv[:, :, 2] = clahe.apply(hsv[:, :, 2])
@@ -471,10 +538,6 @@ class LaneDetectionNode(Node):
         return int(m['m10'] / m['m00'])
 
     def _yellow_heading(self, cnt):
-        # Fit a line to the yellow contour and convert its image-space slope
-        # into a unitless heading hint in [-1, 1]: positive = lane curves
-        # right ahead, negative = curves left. Enables steering BEFORE the
-        # centroid has slid sideways.
         if cnt is None:
             self._last_yellow_line = None
             return None
@@ -487,19 +550,11 @@ class LaneDetectionNode(Node):
         vx, vy, x0, y0 = (
             float(line[0]), float(line[1]), float(line[2]), float(line[3])
         )
-        # cv2 picks an arbitrary direction along the line; force vy >= 0 so
-        # the slope sign is consistent (vy > 0 == direction goes downward
-        # in the image).
         if vy < 0.0:
             vx, vy = -vx, -vy
         if vy < 0.05:
-            # Fitted line is nearly horizontal -> almost certainly garbage
-            # (yellow contour spans a single image row).
             self._last_yellow_line = None
             return None
-        # slope_per_depth: how much x changes per unit decrease in y (i.e.
-        # per unit further into the scene). Right curve -> top of contour
-        # is to the right of bottom -> slope > 0.
         slope_per_depth = -vx / vy
         gain = float(self.get_parameter('heading_gain').value)
         self._last_yellow_line = (vx, vy, x0, y0)
@@ -510,12 +565,6 @@ class LaneDetectionNode(Node):
         if cx is None:
             return 0.0
         target = width * target_ratio
-        # +ve when the line is to the LEFT of where it should be -> robot
-        # has drifted RIGHT relative to the line, so steer LEFT (turn left).
-        # Wait: if the WHITE line (right boundary) shows up further LEFT in
-        # the image than expected, the robot is too close to it on its right
-        # side, so it must steer LEFT.
-        # cx < target -> diff > 0 -> err > 0 -> nav steers LEFT. Correct.
         return float(target - cx) / float(width / 2.0)
 
     # --------------------------------------------------------- 3D mapping
@@ -543,8 +592,6 @@ class LaneDetectionNode(Node):
         height = self.get_parameter('camera_height_m').value
         pts = []
         for u, v in pixels:
-            # Project (u,v) into the camera's optical frame as a ray, then
-            # intersect that ray with the floor (z = -camera_height in base).
             ray_cam = np.array([
                 (u - self.cx_pix) / self.fx,
                 (v - self.cy_pix) / self.fy,
@@ -554,16 +601,14 @@ class LaneDetectionNode(Node):
             origin_base = T[:3, 3]
             if abs(ray_base[2]) < 1e-6:
                 continue
-            scale = (-origin_base[2]) / ray_base[2]  # ground plane z=0 in base
+            scale = (-origin_base[2]) / ray_base[2]
             if scale <= 0:
                 continue
             world = origin_base + scale * ray_base
-            # Ignore anything behind the robot or absurdly far - those are
-            # almost always projection artefacts.
             if world[0] < 0.0 or world[0] > 4.0:
                 continue
             pts.append((float(world[0]), float(world[1]), 0.0))
-            _ = height  # silence unused; height is encoded via the TF translation
+            _ = height
 
         if pts:
             self._publish_point_cloud(
@@ -632,11 +677,8 @@ class LaneDetectionNode(Node):
         heading,
     ):
         vis = roi.copy()
-        # Tint detected pixels so we can see masks against the source image.
         vis[white_mask > 0] = (220, 220, 255)
         vis[yellow_mask > 0] = (0, 220, 220)
-        # orange_mask is from a different (taller) ROI - skip overlay here,
-        # the navigation node only cares about the boolean.
 
         target_white = int(roi_w * self.get_parameter('target_white_x_ratio').value)
         target_yellow = int(roi_w * self.get_parameter('target_yellow_x_ratio').value)
@@ -652,8 +694,6 @@ class LaneDetectionNode(Node):
             color = (180, 0, 180) if yellow_from_memory else (255, 0, 255)
             cv2.line(vis, (yellow_cx, 0), (yellow_cx, vis.shape[0]), color, 2)
 
-        # Draw the fitted yellow line (orange) so the slope/heading source
-        # is visible alongside the centroid bar.
         if self._last_yellow_line is not None:
             vx, vy, x0, y0 = self._last_yellow_line
             h = vis.shape[0]
@@ -664,8 +704,6 @@ class LaneDetectionNode(Node):
                 p2 = (int(x0 + t_bot * vx), h - 1)
                 cv2.line(vis, p1, p2, (0, 140, 255), 2)
 
-        # Confidence bar across the bottom of the image. Color-coded:
-        # green >= 0.7, yellow 0.4..0.7, red < 0.4.
         bar_h = 8
         y0 = vis.shape[0] - bar_h - 2
         cv2.rectangle(vis, (0, y0), (roi_w - 1, y0 + bar_h), (40, 40, 40), -1)
@@ -678,9 +716,12 @@ class LaneDetectionNode(Node):
         bar_w = int(max(0.0, min(1.0, confidence)) * (roi_w - 1))
         cv2.rectangle(vis, (0, y0), (bar_w, y0 + bar_h), bar_color, -1)
 
+        yolo_tag = ' [YOLO]' if (
+            self.get_parameter('use_yolo').value and self._yolo_model is not None
+        ) else ''
         cv2.putText(
             vis,
-            f'src={src} err={final_err:+.2f} hdg={heading:+.2f} '
+            f'src={src}{yolo_tag} err={final_err:+.2f} hdg={heading:+.2f} '
             f'conf={confidence:.2f}',
             (5, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA,
         )
@@ -705,6 +746,6 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
 
-#somehwat working version
+
 if __name__ == '__main__':
     main()

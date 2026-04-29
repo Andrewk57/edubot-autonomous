@@ -26,7 +26,9 @@ DRIVING       - PD on lateral error; angular and linear limits scale with
                 detection confidence so a brief loss does not produce a
                 max-rate spin
 OBSTACLE      - LiDAR cone is occupied; hold zero velocity until clear
-U_TURN        - end-of-road triggered; rotate ~180 then -> RECOVERY
+U_TURN        - end-of-road triggered; 3-phase: rotate 90 deg CCW, creep
+                forward across the centre line, rotate 90 deg CCW again,
+                then -> RECOVERY
 INTERSECTION  - confidence collapsed while the robot was going straight ->
                 90 deg right turn (assignment rule), then -> RECOVERY
 RECOVERY      - slow forward creep with no PD until lane is reacquired or
@@ -83,53 +85,51 @@ class NavigationNode(Node):
         # so the robot doesn't carry too much momentum into a 90 deg corner.
         self.declare_parameter('kp', 0.7)
         self.declare_parameter('kd', 0.55)
-        self.declare_parameter('kff', 0.1) 
-        self.declare_parameter('kff_sharp_amp', 1.0) #for inside lane tight turns.
-        self.declare_parameter('heading_slowdown', 0.0) #try 0 if stuff gets messed up.
+        self.declare_parameter('kff', 0.1)
+        self.declare_parameter('kff_sharp_amp', 1.0)
+        self.declare_parameter('heading_slowdown', 0.0)
         self.declare_parameter('max_angular', 1.4)
 
         # Linear speed schedule. Lower max + steeper slowdown to keep the
         # robot from carrying so much momentum into a curve that PD can't
         # correct in time.
-        self.declare_parameter('max_linear', 0.10)
+        self.declare_parameter('max_linear', 0.10) #was working at .1
         self.declare_parameter('min_linear', 0.05)
         self.declare_parameter('linear_slowdown', 0.85)
 
         # Obstacle handling
         self.declare_parameter('obstacle_stop_m', 0.40)
-        self.declare_parameter('obstacle_clear_m', 0.55)  # hysteresis
+        self.declare_parameter('obstacle_clear_m', 0.55)
         self.declare_parameter('obstacle_cone_deg', 20.0)
         self.declare_parameter('obstacle_min_range', 0.05)
 
-        # End-of-road / U-turn. Tighter angular + arrival window than before:
-        # the old defaults overshot enough that we'd come out of the turn off
-        # the lane.
+        # End-of-road / U-turn. 3-phase: two 90 deg CCW rotations with a
+        # forward creep between them. This keeps the manoeuvre within the
+        # road width and avoids the single large 180 rotation crossing back
+        # over the orange line.
         self.declare_parameter('u_turn_angular', 0.6)
-        self.declare_parameter('u_turn_target_deg', 180.0)
         self.declare_parameter('u_turn_arrival_window_deg', 4.0)
-        self.declare_parameter('u_turn_timeout_s', 8.0)
+        self.declare_parameter('u_turn_fwd_secs', 3.0)   # time to creep across centre
+        self.declare_parameter('u_turn_timeout_s', 15.0)  # increased for 3-phase
         self.declare_parameter('u_turn_cooldown_s', 6.0)
 
         # Intersection right-turn (assignment rule: turn right by default).
         # Negative target means clockwise; magnitude is 90 deg. Detection
-        # is intentionally conservative: a brief lane gap on a straightaway
-        # was firing the trigger and causing a phantom right turn, so we
-        # require both a longer sustained loss AND deeper confidence drop.
+        # window reduced from 1.5 s to 0.8 s so the robot triggers before
+        # it has driven too far past the junction.
         self.declare_parameter('intersection_target_deg', -90.0)
         self.declare_parameter('intersection_angular', 0.6)
         self.declare_parameter('intersection_timeout_s', 6.0)
         self.declare_parameter('intersection_cooldown_s', 8.0)
-        self.declare_parameter('intersection_detect_secs', 1.5)
+        self.declare_parameter('intersection_detect_secs', 0.8)
         self.declare_parameter('intersection_low_conf_threshold', 0.15)
         self.declare_parameter('intersection_steady_err_threshold', 0.25)
 
-        # Confidence-aware control. conf_scale is clipped to
-        # [low_conf_min_scale, 1.0] before scaling angular and linear limits.
+        # Confidence-aware control.
         self.declare_parameter('low_conf_min_scale', 0.2)
         self.declare_parameter('steady_err_alpha', 0.2)
 
-        # Spin-out guard. If the PD wants near-saturation angular for this
-        # long while confidence is bad, freeze until detection recovers.
+        # Spin-out guard.
         self.declare_parameter('spin_out_secs', 1.2)
         self.declare_parameter('spin_out_low_conf', 0.4)
         self.declare_parameter('spin_out_recover_conf', 0.5)
@@ -153,8 +153,6 @@ class NavigationNode(Node):
         self._last_error = 0.0
         self._last_error_time = None
 
-        # Confidence defaults to 1.0 so a missing publisher (e.g. running
-        # navigation against an old detection node) does not freeze the bot.
         self._confidence = 1.0
         self._heading = 0.0
         self._steady_err_ema = 0.0
@@ -167,11 +165,12 @@ class NavigationNode(Node):
         self._state = DRIVING
         self._u_turn_start_yaw = None
         self._u_turn_started_at = None
+        self._u_turn_phase = 0            # 0=first 90, 1=forward, 2=second 90
+        self._u_turn_fwd_started_at = None
+        self._u_turn_phase2_started_at = None
         self._u_turn_cooldown_until = 0.0
         self._lost_since = None
 
-        # Intersection turn closes the loop on signed cumulative yaw so a
-        # right-90 doesn't get confused at the +/- pi wrap.
         self._intersection_started_at = None
         self._intersection_last_yaw = None
         self._intersection_accum_yaw = 0.0
@@ -233,7 +232,6 @@ class NavigationNode(Node):
 
     def _odom_cb(self, msg: Odometry):
         q = msg.pose.pose.orientation
-        # yaw from quaternion (z-axis rotation in the world frame)
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self._yaw = math.atan2(siny, cosy)
@@ -259,8 +257,6 @@ class NavigationNode(Node):
             if not math.isfinite(r) or r < rmin:
                 continue
             ang = a + i * inc
-            # normalise to [-pi, pi] so wrap-around doesn't lie about which way
-            # the beam points.
             while ang > math.pi:
                 ang -= 2 * math.pi
             while ang < -math.pi:
@@ -296,9 +292,7 @@ class NavigationNode(Node):
     def _tick(self):
         now = self._now()
 
-        # 1. Obstacle override. Don't preempt an in-progress rotation; those
-        # are time/yaw-bounded and aborting them halfway leaves the robot
-        # mis-aligned.
+        # 1. Obstacle override. Don't preempt an in-progress rotation.
         obs = self._obstacle_distance()
         stop_d = self.get_parameter('obstacle_stop_m').value
         clear_d = self.get_parameter('obstacle_clear_m').value
@@ -321,15 +315,19 @@ class NavigationNode(Node):
             and self._end_of_road
             and now > self._u_turn_cooldown_until
         ):
-            self.get_logger().info('End of road -> U-turn')
+            self.get_logger().info('End of road -> U-turn (3-phase)')
             self._state = U_TURN
             self._u_turn_start_yaw = self._yaw
             self._u_turn_started_at = now
+            self._u_turn_phase = 0
+            self._u_turn_fwd_started_at = None
+            self._u_turn_phase2_started_at = None
 
         # 3. Intersection detection. Only fire when we were going straight
         # (low steady-state error) and confidence has been near zero for
         # long enough that this is a structural lane loss, not a single
-        # bad frame on a curve.
+        # bad frame on a curve. Detection window is 0.8 s (was 1.5 s) so
+        # the robot triggers before it has passed the junction.
         if self._state == DRIVING:
             low_conf_thr = self.get_parameter(
                 'intersection_low_conf_threshold'
@@ -381,14 +379,11 @@ class NavigationNode(Node):
         self._intersection_started_at = self._now()
         self._intersection_last_yaw = self._yaw
         self._intersection_accum_yaw = 0.0
-        # Reset transient PD/spin-out tracking so RECOVERY starts clean.
         self._high_ang_dir = 0
         self._high_ang_since = None
         self._low_conf_since = None
 
     def _run_driving(self):
-        # No fresh error signal -> demote to LOST (briefly) instead of
-        # publishing a stale command.
         if not self._error_is_fresh():
             self._state = LOST
             self._lost_since = self._now()
@@ -412,19 +407,9 @@ class NavigationNode(Node):
         self._last_error = self._error
         self._last_error_time = now
 
-        # Sign convention from lane_detection_node:
-        # err > 0 means white line is too far LEFT in image -> robot drifted
-        # RIGHT toward the boundary -> steer LEFT (positive angular.z in REP-103).
-        # heading > 0 means the lane curves RIGHT ahead -> steer RIGHT
-        # (negative angular.z), so the FF term is subtracted. The amp factor
-        # boosts sharp corners only - on a gentle curve (|h| ~ 0.2) it adds
-        # ~40% with amp=2.0; on a sharp corner (|h| ~ 0.9) it adds ~180%.
         ff_term = kff * self._heading * (1.0 + sharp_amp * abs(self._heading))
         raw_ang = kp * self._error + kd * d_err - ff_term
 
-        # Confidence-aware limits: low confidence -> slow gentle motion, not
-        # max-rate rotation. This is the core fix for the back-and-forth
-        # loop.
         min_scale = self.get_parameter('low_conf_min_scale').value
         conf_scale = max(min_scale, min(1.0, self._confidence))
         ang = max(-max_ang * conf_scale, min(max_ang * conf_scale, raw_ang))
@@ -442,20 +427,12 @@ class NavigationNode(Node):
             * conf_scale,
         )
 
-        # Track steady-state error only during decent confidence so the EMA
-        # reflects real driving conditions rather than the moments right
-        # before a lane loss.
         if self._confidence >= 0.4:
             alpha = self.get_parameter('steady_err_alpha').value
             self._steady_err_ema = (
                 (1.0 - alpha) * self._steady_err_ema + alpha * abs(self._error)
             )
 
-        # Spin-out guard: the controller WANTS sustained near-saturation
-        # angular while confidence is low -> freeze. Use the unclipped raw_ang
-        # so this doesn't depend on the confidence-scaled limit clipping its
-        # own indicator. Pre-existing as a backstop in case some HSV edge
-        # case lets a stale error survive.
         spin_thresh = 0.8 * max_ang
         spin_secs = self.get_parameter('spin_out_secs').value
         spin_low_conf = self.get_parameter('spin_out_low_conf').value
@@ -493,44 +470,71 @@ class NavigationNode(Node):
         )
 
     def _run_u_turn(self):
-        target = math.radians(self.get_parameter('u_turn_target_deg').value)
+        """3-phase U-turn: 90 deg CCW -> creep forward -> 90 deg CCW."""
         omega = self.get_parameter('u_turn_angular').value
-        arrival = math.radians(
-            self.get_parameter('u_turn_arrival_window_deg').value
-        )
+        arrival = math.radians(self.get_parameter('u_turn_arrival_window_deg').value)
         timeout = self.get_parameter('u_turn_timeout_s').value
+        fwd_secs = self.get_parameter('u_turn_fwd_secs').value
+        creep = self.get_parameter('recovery_creep').value
         now = self._now()
         elapsed = now - (self._u_turn_started_at or now)
-
-        # Prefer odometry-based completion. Fall back to time-based so the
-        # state machine still advances if /odom is absent at demo time. The
-        # 180 case is symmetric so abs(angle_diff) is fine here.
-        completed = False
-        if self._yaw is not None and self._u_turn_start_yaw is not None:
-            turned = abs(self._angle_diff(self._yaw, self._u_turn_start_yaw))
-            if turned >= target - arrival:
-                completed = True
-        else:
-            if elapsed >= target / omega:
-                completed = True
+        target_90 = math.radians(90.0)
 
         if elapsed >= timeout:
             self.get_logger().warn('U-turn timeout, entering RECOVERY')
-            completed = True
-
-        if completed:
-            # Hand off to RECOVERY (slow forward creep until the lane is
-            # reacquired) instead of snapping back into DRIVING with the
-            # stale error from before the turn.
-            self._u_turn_cooldown_until = now + self.get_parameter(
-                'u_turn_cooldown_s'
-            ).value
-            self._u_turn_start_yaw = None
-            self._u_turn_started_at = None
-            self._enter_recovery('U-turn complete')
+            self._finish_u_turn(now)
             return
 
-        self._publish_cmd(0.0, omega)
+        if self._u_turn_phase == 0:
+            # First 90 deg CCW rotation
+            completed = False
+            if self._yaw is not None and self._u_turn_start_yaw is not None:
+                turned = abs(self._angle_diff(self._yaw, self._u_turn_start_yaw))
+                completed = turned >= target_90 - arrival
+            else:
+                completed = elapsed >= target_90 / omega
+
+            if completed:
+                self._u_turn_phase = 1
+                self._u_turn_fwd_started_at = now
+                self.get_logger().info('U-turn phase 0 (first 90 deg) done -> creeping forward')
+            else:
+                self._publish_cmd(0.0, omega)
+
+        elif self._u_turn_phase == 1:
+            # Creep forward across the centre line
+            fwd_elapsed = now - (self._u_turn_fwd_started_at or now)
+            if fwd_elapsed >= fwd_secs:
+                self._u_turn_phase = 2
+                self._u_turn_start_yaw = self._yaw  # reset yaw ref for second turn
+                self._u_turn_phase2_started_at = now
+                self.get_logger().info('U-turn phase 1 (forward) done -> second 90 deg')
+            else:
+                self._publish_cmd(creep, 0.0)
+
+        else:
+            # Second 90 deg CCW rotation
+            completed = False
+            if self._yaw is not None and self._u_turn_start_yaw is not None:
+                turned = abs(self._angle_diff(self._yaw, self._u_turn_start_yaw))
+                completed = turned >= target_90 - arrival
+            else:
+                phase2_elapsed = now - (self._u_turn_phase2_started_at or now)
+                completed = phase2_elapsed >= target_90 / omega
+
+            if completed:
+                self._finish_u_turn(now)
+            else:
+                self._publish_cmd(0.0, omega)
+
+    def _finish_u_turn(self, now):
+        self._u_turn_cooldown_until = now + self.get_parameter('u_turn_cooldown_s').value
+        self._u_turn_start_yaw = None
+        self._u_turn_started_at = None
+        self._u_turn_phase = 0
+        self._u_turn_fwd_started_at = None
+        self._u_turn_phase2_started_at = None
+        self._enter_recovery('U-turn complete')
 
     def _run_intersection(self):
         # 90 deg right turn (signed cumulative yaw so the +/- pi wrap doesn't
@@ -562,7 +566,6 @@ class NavigationNode(Node):
                 if self._intersection_accum_yaw >= target - arrival:
                     completed = True
         else:
-            # Time fallback when odometry is unavailable.
             if elapsed >= abs(target / omega):
                 completed = True
 
@@ -586,8 +589,6 @@ class NavigationNode(Node):
         self._state = RECOVERY
         self._recovery_started_at = self._now()
         self._recovery_white_streak = 0
-        # Reset PD derivative state so the first DRIVING tick after recovery
-        # doesn't see a giant dt and produce a spike.
         self._last_error_time = None
         self._high_ang_dir = 0
         self._high_ang_since = None
@@ -623,8 +624,6 @@ class NavigationNode(Node):
         self._publish_cmd(creep, 0.0)
 
     def _run_spin_hold(self):
-        # Hard backstop against the saturated-spin failure mode. Stay parked
-        # until the detector reports we have a real lane to drive on again.
         if self._confidence >= self.get_parameter('spin_out_recover_conf').value:
             self.get_logger().info('SPIN_HOLD -> DRIVING (confidence recovered)')
             self._state = DRIVING
@@ -635,8 +634,6 @@ class NavigationNode(Node):
         self._publish_cmd(0.0, 0.0)
 
     def _run_lost(self):
-        # Try to recover: creep forward briefly. If the lane never reappears
-        # we stop hard so we don't sail off the track.
         if self._error_is_fresh():
             self._state = DRIVING
             self._lost_since = None
@@ -662,6 +659,6 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
 
-# Somewhat working version
+
 if __name__ == '__main__':
     main()
