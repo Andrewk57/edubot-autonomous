@@ -68,21 +68,6 @@ To view the debug camera feed (annotated with detected lanes):
 ros2 run rqt_image_view rqt_image_view /lane/debug_image
 ```
 
----
-
-## Key topics published by lane_detection_node
-
-| Topic | Type | Description |
-|---|---|---|
-| `/lane/error` | Float32 | Lateral error (−1 to 1). Positive = drifting left |
-| `/lane/heading` | Float32 | Feed-forward curve hint (−1 to 1) |
-| `/lane/confidence` | Float32 | Detection confidence (0 = nothing visible, 1 = both lines) |
-| `/lane/end_of_road` | Bool | True when orange stop line is detected |
-| `/lane/white_detected` | Bool | True when right boundary is visible |
-| `/lane/debug_image` | Image | Annotated camera view for tuning |
-
----
-
 ## Troubleshooting
 **Robot not moving** — check that `dry_run:=False` was passed to navigation_node.
 
