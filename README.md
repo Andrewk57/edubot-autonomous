@@ -18,6 +18,9 @@ ROS 2 lane detection and navigation nodes for the EduBot robot. The robot uses a
 ## Running the nodes
 Everything is run over SSH into the robot. You need **three terminals**, each SSH'd in.
 
+sudo ln -s video2 /dev/edubot_camera_2
+ls /dev/edubot_*
+
 ### Terminal 1 — launch the robot base
 ```bash
 ros2 launch edubot edubot.launch.py nav2:=True slam:=True
