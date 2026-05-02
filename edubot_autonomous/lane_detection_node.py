@@ -23,25 +23,6 @@ Outputs (consumed by navigation_node and mapping_node):
   /lane/white_detected std_msgs/Bool           True if white contour was found
   /lane/debug_image    sensor_msgs/Image       annotated mask for tuning
   /lane/points         sensor_msgs/PointCloud2 lane points in base_link for mapping
-
-Design notes
-------------
-The pipeline is intentionally minimal: crop -> HSV -> mask -> contour -> centroid.
-All thresholds are ROS parameters so they can be tuned at runtime with
-`ros2 param set ...` instead of recompiling.
-
-Optionally, a YOLOv8n segmentation model can replace the HSV masks for white
-and yellow detection. Enable with use_yolo:=True and point yolo_model_path at
-the .pt file. The model is expected to have class 0 = White lane,
-class 1 = Yellow Lane. Falls back to HSV if YOLO returns empty detections.
-
-Dashed yellow is intermittent by definition; we hold the last centroid for
-`yellow_memory_secs` so the controller does not see a square wave on it.
-
-The 3D projection assumes a flat floor and uses the camera intrinsics from
-/camera_2/camera_info plus the static base_link <- camera transform. If
-camera_info or TF is not yet available we still publish 2D outputs so
-navigation can run without mapping.
 """
 import math
 import os
@@ -69,19 +50,16 @@ class LaneDetectionNode(Node):
         self.declare_parameter('camera_frame', 'camera_2_optical_frame')
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('publish_camera_tf', True)
-        self.declare_parameter('camera_height_m', 0.15)
+        self.declare_parameter('camera_height_m', 0.22)
         self.declare_parameter('camera_pitch_deg', -45.0)
 
-        # ROI - crop_top_ratio raised to 0.20 to cut out more of the upper
-        # frame where window glare and floor reflections cause false detections.
+        # ROI
         self.declare_parameter('crop_top_ratio', 0.10)
         self.declare_parameter('crop_bottom_ratio', 0.05)
         self.declare_parameter('crop_side_ratio', 0.0)
         self.declare_parameter('crop_top_orange_ratio', 0.10)
 
-        # HSV gates - OpenCV uses H in [0,179], S/V in [0,255].
-        # white_v_min lowered 200->180 to keep detecting white under shadows.
-        # yellow hue range widened (15-50) for robustness under warm/cool lighting.
+        # HSV gates
         self.declare_parameter('white_h_min', 0)
         self.declare_parameter('white_h_max', 179)
         self.declare_parameter('white_s_min', 0)
@@ -120,14 +98,10 @@ class LaneDetectionNode(Node):
         self.declare_parameter('use_clahe', True)
         self.declare_parameter('debug_image', True)
 
-        # YOLO segmentation detector (optional).
-        # Set use_yolo:=True to activate. Set yolo_model_path to the .pt file
-        # on the robot. Falls back to HSV if a detection class is empty.
-        # yolo_frame_skip runs inference every Nth frame to reduce CPU load;
-        # cached masks are used for intermediate frames.
+        # YOLO
         self.declare_parameter('use_yolo', True)
         self.declare_parameter('yolo_model_path',
-            '/home/developer/andrew_ws/src/edubot_autonomous/models/lane_yolov8n_seg.pt')
+            '/home/developer/andrew_ws/src/edubot-autonomous/models/lane_yolov8n_seg.pt')
         self.declare_parameter('yolo_conf_threshold', 0.4)
         self.declare_parameter('yolo_frame_skip', 3)
 
@@ -141,7 +115,6 @@ class LaneDetectionNode(Node):
         self._heading_smoothed = 0.0
         self._last_yellow_line = None
 
-        # YOLO state
         self._yolo_model = None
         self._yolo_frame_count = 0
         self._yolo_white_mask_cache = None
@@ -269,7 +242,7 @@ class LaneDetectionNode(Node):
             yellow_mask = np.zeros((h, w), dtype=np.uint8)
 
             if results and results[0].masks is not None:
-                masks_data = results[0].masks.data.cpu().numpy()  # (N, Hm, Wm)
+                masks_data = results[0].masks.data.cpu().numpy()
                 classes = results[0].boxes.cls.cpu().numpy().astype(int)
                 for i, cls_id in enumerate(classes):
                     if i >= len(masks_data):
@@ -319,7 +292,6 @@ class LaneDetectionNode(Node):
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         hsv_orange = cv2.cvtColor(roi_orange, cv2.COLOR_BGR2HSV)
 
-        # Choose lane mask source: YOLO or HSV
         if self.get_parameter('use_yolo').value and self._yolo_model is not None:
             self._yolo_frame_count += 1
             skip = int(self.get_parameter('yolo_frame_skip').value)
@@ -329,7 +301,6 @@ class LaneDetectionNode(Node):
                     self._yolo_white_mask_cache = yw
                     self._yolo_yellow_mask_cache = yy
 
-            # Use YOLO masks, fall back to HSV per channel if empty
             if (
                 self._yolo_white_mask_cache is not None
                 and cv2.countNonZero(self._yolo_white_mask_cache) >= 100
@@ -355,9 +326,8 @@ class LaneDetectionNode(Node):
         yellow_cnt = self._largest_contour(yellow_mask)
 
         white_cx = self._centroid_x(white_cnt)
-        
 
-# Reject white detections on the wrong side of the frame
+        # Reject white detections on the wrong side of the frame
         if white_cx is not None:
             white_min_x = int(roi_w * self.get_parameter('white_x_min_ratio').value)
             if white_cx < white_min_x:
@@ -571,14 +541,6 @@ class LaneDetectionNode(Node):
     def _maybe_publish_points(self, header, roi_y_offset, white_cnt, yellow_cnt):
         if self.fx is None:
             return
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.get_parameter('base_frame').value,
-                self.get_parameter('camera_frame').value,
-                rclpy.time.Time(),
-            )
-        except TransformException:
-            return
 
         pixels = []
         if white_cnt is not None:
@@ -588,27 +550,44 @@ class LaneDetectionNode(Node):
         if not pixels:
             return
 
-        T = self._tf_to_matrix(tf)
-        height = self.get_parameter('camera_height_m').value
+        # Hardcoded camera mount geometry
+        h = 0.22                       # camera height above floor (m), ~8.7"
+        pitch = math.radians(45.0)     # downward pitch from horizontal
+        cam_x_offset = 0.10            # forward offset of camera from base_link
+
+        cos_p = math.cos(pitch)
+        sin_p = math.sin(pitch)
+
         pts = []
         for u, v in pixels:
-            ray_cam = np.array([
-                (u - self.cx_pix) / self.fx,
-                (v - self.cy_pix) / self.fy,
-                1.0,
-            ])
-            ray_base = T[:3, :3] @ ray_cam
-            origin_base = T[:3, 3]
-            if abs(ray_base[2]) < 1e-6:
+            # Normalized pixel ray in camera optical frame
+            x_norm = (u - self.cx_pix) / self.fx
+            y_norm = (v - self.cy_pix) / self.fy
+
+            # Rotate ray into base_link frame (camera pitched down by `pitch`)
+            # Camera optical: x=right, y=down, z=forward
+            # base_link:      x=forward, y=left, z=up
+            ray_x = cos_p + y_norm * sin_p
+            ray_y = -x_norm
+            ray_z = -sin_p + y_norm * cos_p
+
+            # Skip rays not pointing toward the floor
+            if ray_z >= -1e-6:
                 continue
-            scale = (-origin_base[2]) / ray_base[2]
-            if scale <= 0:
+
+            # Intersect ray with ground plane (z=0)
+            scale = -h / ray_z
+            if scale <= 0 or scale > 10:
                 continue
-            world = origin_base + scale * ray_base
-            if world[0] < 0.0 or world[0] > 4.0:
+
+            wx = cam_x_offset + scale * ray_x
+            wy = scale * ray_y
+
+            # Reject points behind robot or absurdly far away
+            if wx < 0.0 or wx > 4.0:
                 continue
-            pts.append((float(world[0]), float(world[1]), 0.0))
-            _ = height
+
+            pts.append((float(wx), float(wy), 0.0))
 
         if pts:
             self._publish_point_cloud(
