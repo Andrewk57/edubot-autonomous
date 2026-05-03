@@ -1,39 +1,18 @@
 """
 mapping_node.py
 ===============
-Accumulates lane line points published by lane_detection_node and builds a
-persistent map of the lane layout in the /map frame for display in RViz.
+Builds a persistent lane-line map in /map by accumulating points from
+lane_detection_node. Publishes:
 
-Inputs
-------
-/lane/points   sensor_msgs/PointCloud2   sparse lane points in base_link frame,
-                                         published each camera frame by
-                                         lane_detection_node
+  /lane_map/points   PointCloud2     (combined, backward compat)
+  /lane_map/markers  MarkerArray     colored cube list per class - this is the
+                                     one that actually looks like a map in RViz
+  /lane_map/grid     OccupancyGrid   top-down 2D occupancy of lane lines
 
-Outputs
--------
-/lane_map/points  sensor_msgs/PointCloud2  accumulated lane points in /map frame
-
-How it works
-------------
-1. Each incoming /lane/points cloud is transformed from base_link -> map using
-   TF2.  If the /map frame is not yet available (SLAM not running) the message
-   is silently skipped and navigation continues normally.
-
-2. Transformed points are inserted into a voxel dictionary keyed by
-   (int(x/voxel_size), int(y/voxel_size)).  Only one point is kept per cell,
-   so memory is naturally bounded and the cloud stays sparse.
-
-3. A timer publishes the full accumulated cloud at publish_hz (default 2 Hz).
-   This decouples the map publish rate from the camera frame rate.
-
-Parameters
-----------
-base_frame   str    base_link   Source frame of incoming points
-map_frame    str    map         Target accumulation frame (must be provided by SLAM)
-voxel_size   float  0.05        Grid cell size in metres for downsampling
-publish_hz   float  2.0         Rate at which the full map is re-published
-max_points   int    50000       Hard cap on stored voxels; oldest evicted first
+Subscribes (any of the three; /lane/points alone still works):
+  /lane/points          - combined (no class info, treated as 'white')
+  /lane/points/white    - white solid line
+  /lane/points/yellow   - yellow dashed line
 """
 
 import struct
@@ -42,6 +21,11 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, PointField
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+from std_msgs.msg import ColorRGBA
+from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import MapMetaData
 
 import tf2_ros
 from tf2_ros import TransformException
@@ -53,84 +37,136 @@ class MappingNode(Node):
 
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('map_frame', 'map')
-        self.declare_parameter('voxel_size', 0.05)
+        self.declare_parameter('voxel_size', 0.08)
         self.declare_parameter('publish_hz', 2.0)
-        self.declare_parameter('max_points', 50000)
+        self.declare_parameter('max_points_per_class', 30000)
+        self.declare_parameter('grid_size_m', 12.0)
+        self.declare_parameter('grid_resolution_m', 0.05)
+        self.declare_parameter('marker_cube_size', 0.07)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Voxel dict: (ix, iy) -> (x, y, z) in map frame.
-        # Using an ordered-insertion list of keys so we can evict oldest first.
-        self._voxel_map: dict = {}
-        self._voxel_order: list = []
+        # Two voxel maps, one per class. key=(ix,iy) -> (xm, ym).
+        self._white_map: dict = {}
+        self._white_order: list = []
+        self._yellow_map: dict = {}
+        self._yellow_order: list = []
 
-        self.create_subscription(
-            PointCloud2,
-            '/lane/points',
-            self._lane_points_cb,
-            10,
-        )
+        self.create_subscription(PointCloud2, '/lane/points',
+                                 lambda m: self._lane_cb(m, 'white'), 10)
+        self.create_subscription(PointCloud2, '/lane/points/white',
+                                 lambda m: self._lane_cb(m, 'white'), 10)
+        self.create_subscription(PointCloud2, '/lane/points/yellow',
+                                 lambda m: self._lane_cb(m, 'yellow'), 10)
 
-        self.pub_map = self.create_publisher(PointCloud2, '/lane_map/points', 10)
+        self.pub_cloud   = self.create_publisher(PointCloud2,  '/lane_map/points',  10)
+        self.pub_markers = self.create_publisher(MarkerArray,  '/lane_map/markers', 10)
+        self.pub_grid    = self.create_publisher(OccupancyGrid,'/lane_map/grid',    10)
 
         hz = self.get_parameter('publish_hz').value
-        self.create_timer(1.0 / hz, self._publish_map)
+        self.create_timer(1.0 / hz, self._publish_all)
 
-        self.get_logger().info('Mapping node up — waiting for /lane/points and /map TF.')
+        self.get_logger().info(
+            'Mapping node up - subscribing /lane/points{,/white,/yellow}, '
+            'waiting on /map TF.'
+        )
 
-    # ------------------------------------------------------------------ callback
-    def _lane_points_cb(self, msg: PointCloud2):
-        map_frame = self.get_parameter('map_frame').value
+    # ----------------------------------------------------------- ingest
+    def _lane_cb(self, msg: PointCloud2, cls: str):
+        map_frame  = self.get_parameter('map_frame').value
         base_frame = self.get_parameter('base_frame').value
 
         try:
-            tf = self.tf_buffer.lookup_transform(
-                map_frame,
-                base_frame,
-                rclpy.time.Time(),
-            )
+            tf = self.tf_buffer.lookup_transform(map_frame, base_frame, rclpy.time.Time())
         except TransformException:
             self.get_logger().warn(
-                f'TF not available: {base_frame} -> {map_frame}. '
-                'Is SLAM running?',
+                f'TF not available: {base_frame} -> {map_frame}. SLAM running?',
                 throttle_duration_sec=5.0,
             )
             return
 
         T = self._tf_to_matrix(tf)
-        points_base = self._unpack_cloud(msg)
-        if not points_base:
+        pts_base = self._unpack_cloud(msg)
+        if not pts_base:
             return
 
-        voxel = self.get_parameter('voxel_size').value
-        max_pts = int(self.get_parameter('max_points').value)
+        voxel = float(self.get_parameter('voxel_size').value)
+        max_pts = int(self.get_parameter('max_points_per_class').value)
 
-        for x, y, z in points_base:
+        if cls == 'yellow':
+            vmap, vorder = self._yellow_map, self._yellow_order
+        else:
+            vmap, vorder = self._white_map, self._white_order
+
+        for x, y, z in pts_base:
             p = np.array([x, y, z, 1.0])
             pm = T @ p
-            xm, ym, zm = float(pm[0]), float(pm[1]), float(pm[2])
-
+            xm, ym = float(pm[0]), float(pm[1])
             key = (int(xm / voxel), int(ym / voxel))
-            if key not in self._voxel_map:
-                if len(self._voxel_order) >= max_pts:
-                    # Evict the oldest voxel
-                    old_key = self._voxel_order.pop(0)
-                    self._voxel_map.pop(old_key, None)
-                self._voxel_order.append(key)
-            self._voxel_map[key] = (xm, ym, 0.0)
+            if key not in vmap:
+                if len(vorder) >= max_pts:
+                    vmap.pop(vorder.pop(0), None)
+                vorder.append(key)
+            vmap[key] = (xm, ym)
 
-    # ------------------------------------------------------------------ timer
-    def _publish_map(self):
-        if not self._voxel_map:
+    # ----------------------------------------------------------- publish
+    def _publish_all(self):
+        if not self._white_map and not self._yellow_map:
             return
-
-        pts = list(self._voxel_map.values())
         map_frame = self.get_parameter('map_frame').value
+        stamp = self.get_clock().now().to_msg()
 
+        self._publish_markers(map_frame, stamp)
+        self._publish_combined_cloud(map_frame, stamp)
+        self._publish_occupancy(map_frame, stamp)
+
+        self.get_logger().info(
+            f'lane_map: white={len(self._white_map)}  yellow={len(self._yellow_map)}',
+            throttle_duration_sec=5.0,
+        )
+
+    def _publish_markers(self, frame_id, stamp):
+        size = float(self.get_parameter('marker_cube_size').value)
+        arr = MarkerArray()
+
+        def make_marker(mid, pts, rgba):
+            m = Marker()
+            m.header.frame_id = frame_id
+            m.header.stamp = stamp
+            m.ns = 'lane_map'
+            m.id = mid
+            m.type = Marker.CUBE_LIST
+            m.action = Marker.ADD
+            m.scale.x = size
+            m.scale.y = size
+            m.scale.z = 0.02
+            m.color = ColorRGBA(r=rgba[0], g=rgba[1], b=rgba[2], a=rgba[3])
+            m.pose.orientation.w = 1.0
+            for (x, y) in pts:
+                p = Point()
+                p.x, p.y, p.z = x, y, 0.01
+                m.points.append(p)
+            return m
+
+        # White line: bright white, slightly transparent.
+        arr.markers.append(make_marker(
+            0, list(self._white_map.values()),  (1.0, 1.0, 1.0, 0.95)
+        ))
+        # Yellow line: high-vis yellow.
+        arr.markers.append(make_marker(
+            1, list(self._yellow_map.values()), (1.0, 0.9, 0.0, 0.95)
+        ))
+        self.pub_markers.publish(arr)
+
+    def _publish_combined_cloud(self, frame_id, stamp):
+        pts = [(x, y, 0.0) for (x, y) in self._white_map.values()]
+        pts += [(x, y, 0.0) for (x, y) in self._yellow_map.values()]
+        if not pts:
+            return
         msg = PointCloud2()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = map_frame
+        msg.header.stamp = stamp
+        msg.header.frame_id = frame_id
         msg.height = 1
         msg.width = len(pts)
         msg.fields = [
@@ -143,30 +179,59 @@ class MappingNode(Node):
         msg.row_step = 12 * len(pts)
         msg.is_dense = True
         msg.data = np.array(pts, dtype=np.float32).tobytes()
-        self.pub_map.publish(msg)
+        self.pub_cloud.publish(msg)
 
-        self.get_logger().info(
-            f'Lane map published: {len(pts)} voxels in {map_frame}',
-            throttle_duration_sec=5.0,
-        )
+    def _publish_occupancy(self, frame_id, stamp):
+        size_m = float(self.get_parameter('grid_size_m').value)
+        res    = float(self.get_parameter('grid_resolution_m').value)
+        n = int(size_m / res)
 
-    # ------------------------------------------------------------------ helpers
+        # Center grid on the centroid of all stored points so it follows the map.
+        all_pts = list(self._white_map.values()) + list(self._yellow_map.values())
+        if not all_pts:
+            return
+        arr = np.array(all_pts, dtype=np.float32)
+        cx, cy = float(arr[:, 0].mean()), float(arr[:, 1].mean())
+        origin_x = cx - size_m / 2.0
+        origin_y = cy - size_m / 2.0
+
+        grid = np.full((n, n), -1, dtype=np.int8)  # unknown
+        for (x, y) in all_pts:
+            ix = int((x - origin_x) / res)
+            iy = int((y - origin_y) / res)
+            if 0 <= ix < n and 0 <= iy < n:
+                grid[iy, ix] = 100  # occupied
+
+        msg = OccupancyGrid()
+        msg.header.frame_id = frame_id
+        msg.header.stamp = stamp
+        meta = MapMetaData()
+        meta.resolution = res
+        meta.width = n
+        meta.height = n
+        meta.origin.position.x = origin_x
+        meta.origin.position.y = origin_y
+        meta.origin.orientation.w = 1.0
+        msg.info = meta
+        msg.data = grid.flatten().tolist()
+        self.pub_grid.publish(msg)
+
+    # ----------------------------------------------------------- helpers
     @staticmethod
     def _unpack_cloud(msg: PointCloud2):
-        """Unpack a PointCloud2 message into a list of (x, y, z) tuples."""
-        points = []
-        point_step = msg.point_step
+        pts = []
+        ps = msg.point_step
         data = msg.data
         n = msg.width * msg.height
         for i in range(n):
-            offset = i * point_step
-            if offset + 12 > len(data):
+            off = i * ps
+            if off + 12 > len(data):
                 break
-            x, y, z = struct.unpack_from('fff', data, offset)
+            x, y, z = struct.unpack_from('fff', data, off)
             if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(z)):
                 continue
-            points.append((x, y, z))
-        return points
+            pts.append((x, y, z))
+        return pts
 
     @staticmethod
     def _tf_to_matrix(tf):
@@ -174,9 +239,9 @@ class MappingNode(Node):
         r = tf.transform.rotation
         qx, qy, qz, qw = r.x, r.y, r.z, r.w
         rot = np.array([
-            [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
-            [2*(qx*qy + qz*qw), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*qw)],
-            [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx**2 + qy**2)],
+            [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
+            [2*(qx*qy + qz*qw),     1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*qw)],
+            [2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw),     1 - 2*(qx**2 + qy**2)],
         ])
         T = np.eye(4)
         T[:3, :3] = rot

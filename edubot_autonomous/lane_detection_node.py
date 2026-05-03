@@ -94,6 +94,9 @@ class LaneDetectionNode(Node):
         self.declare_parameter('confidence_smoothing', 0.5)
         self.declare_parameter('heading_smoothing', 0.6)
         self.declare_parameter('heading_gain', 1.5)
+        self.declare_parameter('max_lane_range_m', 1.2)        # cap projected lane points to this depth
+        self.declare_parameter('lane_sample_points_white', 30) # was hardcoded 8
+        self.declare_parameter('lane_sample_points_yellow', 20) # was hardcoded 5
         self.declare_parameter('heading_min_points', 8)
         self.declare_parameter('use_clahe', True)
         self.declare_parameter('debug_image', True)
@@ -144,6 +147,8 @@ class LaneDetectionNode(Node):
 
         self.pub_error = self.create_publisher(Float32, '/lane/error', 10)
         self.pub_heading = self.create_publisher(Float32, '/lane/heading', 10)
+        self.pub_points_white  = self.create_publisher(PointCloud2, '/lane/points/white',  10)
+        self.pub_points_yellow = self.create_publisher(PointCloud2, '/lane/points/yellow', 10)
         self.pub_conf = self.create_publisher(Float32, '/lane/confidence', 10)
         self.pub_eor = self.create_publisher(Bool, '/lane/end_of_road', 10)
         self.pub_white_det = self.create_publisher(Bool, '/lane/white_detected', 10)
@@ -542,57 +547,56 @@ class LaneDetectionNode(Node):
         if self.fx is None:
             return
 
-        pixels = []
-        if white_cnt is not None:
-            pixels.extend(self._sample_contour(white_cnt, roi_y_offset, n=8))
-        if yellow_cnt is not None:
-            pixels.extend(self._sample_contour(yellow_cnt, roi_y_offset, n=5))
-        if not pixels:
+        n_white  = int(self.get_parameter('lane_sample_points_white').value)
+        n_yellow = int(self.get_parameter('lane_sample_points_yellow').value)
+
+        white_pix  = self._sample_contour(white_cnt,  roi_y_offset, n=n_white)  if white_cnt  is not None else []
+        yellow_pix = self._sample_contour(yellow_cnt, roi_y_offset, n=n_yellow) if yellow_cnt is not None else []
+        if not white_pix and not yellow_pix:
             return
 
-        # Hardcoded camera mount geometry
-        h = 0.22                       # camera height above floor (m), ~8.7"
-        pitch = math.radians(45.0)     # downward pitch from horizontal
-        cam_x_offset = 0.10            # forward offset of camera from base_link
+        # Hardcoded mount geometry - verified working, camera does not move.
+        h = 0.22
+        pitch = math.radians(45.0)
+        cam_x_offset = 0.10
+        max_range = float(self.get_parameter('max_lane_range_m').value)
 
         cos_p = math.cos(pitch)
         sin_p = math.sin(pitch)
 
-        pts = []
-        for u, v in pixels:
-            # Normalized pixel ray in camera optical frame
-            x_norm = (u - self.cx_pix) / self.fx
-            y_norm = (v - self.cy_pix) / self.fy
+        def project(pixels):
+            out = []
+            for u, v in pixels:
+                x_norm = (u - self.cx_pix) / self.fx
+                y_norm = (v - self.cy_pix) / self.fy
+                ray_x =  cos_p + y_norm * sin_p
+                ray_y = -x_norm
+                ray_z = -sin_p + y_norm * cos_p
+                if ray_z >= -1e-6:
+                    continue
+                scale = -h / ray_z
+                if scale <= 0.0:
+                    continue
+                wx = cam_x_offset + scale * ray_x
+                wy = scale * ray_y
+                # Near-range only - kills far-field projection 'fog'.
+                if wx < 0.05 or wx > max_range:
+                    continue
+                if abs(wy) > max_range:
+                    continue
+                out.append((float(wx), float(wy), 0.0))
+            return out
 
-            # Rotate ray into base_link frame (camera pitched down by `pitch`)
-            # Camera optical: x=right, y=down, z=forward
-            # base_link:      x=forward, y=left, z=up
-            ray_x = cos_p + y_norm * sin_p
-            ray_y = -x_norm
-            ray_z = -sin_p + y_norm * cos_p
+        white_pts  = project(white_pix)
+        yellow_pts = project(yellow_pix)
 
-            # Skip rays not pointing toward the floor
-            if ray_z >= -1e-6:
-                continue
-
-            # Intersect ray with ground plane (z=0)
-            scale = -h / ray_z
-            if scale <= 0 or scale > 10:
-                continue
-
-            wx = cam_x_offset + scale * ray_x
-            wy = scale * ray_y
-
-            # Reject points behind robot or absurdly far away
-            if wx < 0.0 or wx > 4.0:
-                continue
-
-            pts.append((float(wx), float(wy), 0.0))
-
-        if pts:
-            self._publish_point_cloud(
-                header, pts, self.get_parameter('base_frame').value
-            )
+        base = self.get_parameter('base_frame').value
+        if white_pts:
+            self._publish_point_cloud_to(self.pub_points_white,  header, white_pts,  base)
+        if yellow_pts:
+            self._publish_point_cloud_to(self.pub_points_yellow, header, yellow_pts, base)
+        if white_pts or yellow_pts:
+            self._publish_point_cloud_to(self.pub_points, header, white_pts + yellow_pts, base)
 
     @staticmethod
     def _sample_contour(cnt, roi_y_offset, n=6):
@@ -618,7 +622,7 @@ class LaneDetectionNode(Node):
         T[:3, 3] = [t.x, t.y, t.z]
         return T
 
-    def _publish_point_cloud(self, header, points, frame_id):
+    def _publish_point_cloud_to(self, publisher, header, points, frame_id):
         msg = PointCloud2()
         msg.header.stamp = header.stamp
         msg.header.frame_id = frame_id
@@ -634,7 +638,7 @@ class LaneDetectionNode(Node):
         msg.row_step = 12 * len(points)
         msg.is_dense = True
         msg.data = np.array(points, dtype=np.float32).tobytes()
-        self.pub_points.publish(msg)
+        publisher.publish(msg)
 
     # ----------------------------------------------------------- debug img
     def _publish_debug(
