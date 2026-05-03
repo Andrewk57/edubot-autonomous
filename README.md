@@ -21,7 +21,7 @@ camera with a YOLOv8 segmentation model.
 
 ## Run
 
-SSH into the robot. Before the first launch on a fresh boot:
+SSH into the robot. Only run if you can't get both cameras in topic list:
 
 ```bash
 sudo ln -s /dev/video2 /dev/edubot_camera_2
