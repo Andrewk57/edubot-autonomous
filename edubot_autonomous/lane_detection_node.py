@@ -8,21 +8,15 @@ Detects three colored features on the floor:
   * Dashed YELLOW line -> centre divider (may be crossed to dodge obstacles)
   * Solid ORANGE line  -> end-of-road marker (triggers a 180 turn upstream)
 
-Outputs (consumed by navigation_node and mapping_node):
-  /lane/error          std_msgs/Float32        normalised lateral error in [-1, 1]
-                                               +ve = drift LEFT (steer right)
-                                               -ve = drift RIGHT (steer left)
-  /lane/heading        std_msgs/Float32        feed-forward heading hint in
-                                               [-1, 1] from the yellow line
-                                               slope; +ve = lane curves right
-  /lane/confidence     std_msgs/Float32        detection confidence in [0, 1]
-                                               1.0 both lanes, 0.7 white only,
-                                               0.5 yellow live, 0.3 yellow memory,
-                                               0.0 nothing visible
-  /lane/end_of_road    std_msgs/Bool           True after orange line is sustained
-  /lane/white_detected std_msgs/Bool           True if white contour was found
-  /lane/debug_image    sensor_msgs/Image       annotated mask for tuning
-  /lane/points         sensor_msgs/PointCloud2 lane points in base_link for mapping
+Outputs:
+  /lane/error          std_msgs/Float32
+  /lane/heading        std_msgs/Float32
+  /lane/confidence     std_msgs/Float32
+  /lane/end_of_road    std_msgs/Bool
+  /lane/orange_partial std_msgs/Bool
+  /lane/white_detected std_msgs/Bool
+  /lane/debug_image    sensor_msgs/Image
+  /lane/points         sensor_msgs/PointCloud2
 """
 import math
 import os
@@ -37,7 +31,7 @@ from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from std_msgs.msg import Bool, Float32
 
 import tf2_ros
-from tf2_ros import StaticTransformBroadcaster, TransformException
+from tf2_ros import StaticTransformBroadcaster
 
 
 class LaneDetectionNode(Node):
@@ -81,30 +75,38 @@ class LaneDetectionNode(Node):
         self.declare_parameter('orange_v_min', 120)
         self.declare_parameter('orange_v_max', 255)
 
-        # Geometry / behavior.
+        # Geometry / behavior
         self.declare_parameter('min_contour_area', 1500.0)
         self.declare_parameter('target_white_x_ratio', 0.80)
         self.declare_parameter('target_yellow_x_ratio', 0.30)
         self.declare_parameter('white_x_min_ratio', 0.45)
         self.declare_parameter('yellow_weight', 0.35)
         self.declare_parameter('yellow_memory_secs', 0.25)
-        self.declare_parameter('min_orange_pixels', 4000)
-        self.declare_parameter('min_orange_width_ratio', 0.45)
-        self.declare_parameter('orange_consecutive_frames', 3)
+
+        # Orange / end-of-road.
+        # These are intentionally sensitive so U-turn wins before intersection.
+        self.declare_parameter('min_orange_pixels', 8000)
+        self.declare_parameter('min_orange_partial_pixels', 100)
+        self.declare_parameter('min_orange_width_ratio', 0.0)
+        self.declare_parameter('orange_consecutive_frames', 1)
+
         self.declare_parameter('confidence_smoothing', 0.5)
         self.declare_parameter('heading_smoothing', 0.6)
-        self.declare_parameter('heading_gain', 1.5)
-        self.declare_parameter('max_lane_range_m', 1.2)        # cap projected lane points to this depth
-        self.declare_parameter('lane_sample_points_white', 30) # was hardcoded 8
-        self.declare_parameter('lane_sample_points_yellow', 20) # was hardcoded 5
+        self.declare_parameter('heading_gain', 0.8)
+        self.declare_parameter('heading_deadband', 0.15)
+        self.declare_parameter('max_lane_range_m', 1.2)
+        self.declare_parameter('lane_sample_points_white', 30)
+        self.declare_parameter('lane_sample_points_yellow', 20)
         self.declare_parameter('heading_min_points', 8)
         self.declare_parameter('use_clahe', True)
         self.declare_parameter('debug_image', True)
 
         # YOLO
         self.declare_parameter('use_yolo', True)
-        self.declare_parameter('yolo_model_path',
-            '/home/developer/andrew_ws/src/edubot-autonomous/models/lane_yolov8n_seg.pt')
+        self.declare_parameter(
+            'yolo_model_path',
+            '/home/developer/andrew_ws/src/edubot-autonomous/models/lane_yolov8n_seg.pt'
+        )
         self.declare_parameter('yolo_conf_threshold', 0.4)
         self.declare_parameter('yolo_frame_skip', 3)
 
@@ -126,6 +128,7 @@ class LaneDetectionNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self._static_tf_broadcaster = StaticTransformBroadcaster(self)
+
         if self.get_parameter('publish_camera_tf').value:
             self._publish_camera_tf()
 
@@ -147,11 +150,20 @@ class LaneDetectionNode(Node):
 
         self.pub_error = self.create_publisher(Float32, '/lane/error', 10)
         self.pub_heading = self.create_publisher(Float32, '/lane/heading', 10)
-        self.pub_points_white  = self.create_publisher(PointCloud2, '/lane/points/white',  10)
-        self.pub_points_yellow = self.create_publisher(PointCloud2, '/lane/points/yellow', 10)
+        self.pub_points_white = self.create_publisher(
+            PointCloud2, '/lane/points/white', 10
+        )
+        self.pub_points_yellow = self.create_publisher(
+            PointCloud2, '/lane/points/yellow', 10
+        )
         self.pub_conf = self.create_publisher(Float32, '/lane/confidence', 10)
         self.pub_eor = self.create_publisher(Bool, '/lane/end_of_road', 10)
-        self.pub_white_det = self.create_publisher(Bool, '/lane/white_detected', 10)
+        self.pub_orange_partial = self.create_publisher(
+            Bool, '/lane/orange_partial', 10
+        )
+        self.pub_white_det = self.create_publisher(
+            Bool, '/lane/white_detected', 10
+        )
         self.pub_debug = self.create_publisher(Image, '/lane/debug_image', 10)
         self.pub_points = self.create_publisher(PointCloud2, '/lane/points', 10)
 
@@ -175,6 +187,7 @@ class LaneDetectionNode(Node):
             [-sp, 0.0, -cp],
             [cp, 0.0, -sp],
         ])
+
         qw, qx, qy, qz = self._mat_to_quat(rot)
         t.transform.rotation.w = qw
         t.transform.rotation.x = qx
@@ -224,8 +237,10 @@ class LaneDetectionNode(Node):
     # ------------------------------------------------------------------ YOLO
     def _load_yolo_model(self):
         try:
-            from ultralytics import YOLO  # noqa: PLC0415
-            path = os.path.expanduser(self.get_parameter('yolo_model_path').value)
+            from ultralytics import YOLO
+            path = os.path.expanduser(
+                self.get_parameter('yolo_model_path').value
+            )
             self._yolo_model = YOLO(path)
             self.get_logger().info(f'YOLO model loaded from {path}')
         except Exception as exc:
@@ -233,9 +248,10 @@ class LaneDetectionNode(Node):
             self._yolo_model = None
 
     def _yolo_detect(self, roi):
-        """Run YOLO segmentation; return (white_mask, yellow_mask) uint8 or (None, None)."""
+        """Run YOLO segmentation; return (white_mask, yellow_mask)."""
         if self._yolo_model is None:
             return None, None
+
         try:
             h, w = roi.shape[:2]
             results = self._yolo_model.predict(
@@ -243,25 +259,30 @@ class LaneDetectionNode(Node):
                 conf=float(self.get_parameter('yolo_conf_threshold').value),
                 verbose=False,
             )
+
             white_mask = np.zeros((h, w), dtype=np.uint8)
             yellow_mask = np.zeros((h, w), dtype=np.uint8)
 
             if results and results[0].masks is not None:
                 masks_data = results[0].masks.data.cpu().numpy()
                 classes = results[0].boxes.cls.cpu().numpy().astype(int)
+
                 for i, cls_id in enumerate(classes):
                     if i >= len(masks_data):
                         break
+
                     m = cv2.resize(
                         masks_data[i], (w, h), interpolation=cv2.INTER_LINEAR
                     )
                     binary = (m > 0.5).astype(np.uint8) * 255
+
                     if cls_id == 0:
                         white_mask = cv2.bitwise_or(white_mask, binary)
                     elif cls_id == 1:
                         yellow_mask = cv2.bitwise_or(yellow_mask, binary)
 
             return white_mask, yellow_mask
+
         except Exception as exc:
             self.get_logger().warn(
                 f'YOLO detection failed: {exc}', throttle_duration_sec=5.0
@@ -277,13 +298,16 @@ class LaneDetectionNode(Node):
             return
 
         h, w_full = frame.shape[:2]
+
         roi_top = int(h * self.get_parameter('crop_top_ratio').value)
         roi_bot = int(h * (1.0 - self.get_parameter('crop_bottom_ratio').value))
+
         side = self.get_parameter('crop_side_ratio').value
         x_lo = int(w_full * side)
         x_hi = w_full - x_lo
         if x_hi - x_lo < 4:
             x_lo, x_hi = 0, w_full
+
         roi = frame[roi_top:roi_bot, x_lo:x_hi]
         roi_h, roi_w = roi.shape[:2]
 
@@ -300,7 +324,11 @@ class LaneDetectionNode(Node):
         if self.get_parameter('use_yolo').value and self._yolo_model is not None:
             self._yolo_frame_count += 1
             skip = int(self.get_parameter('yolo_frame_skip').value)
-            if self._yolo_frame_count % skip == 0 or self._yolo_white_mask_cache is None:
+
+            if (
+                self._yolo_frame_count % skip == 0
+                or self._yolo_white_mask_cache is None
+            ):
                 yw, yy = self._yolo_detect(roi)
                 if yw is not None:
                     self._yolo_white_mask_cache = yw
@@ -332,16 +360,19 @@ class LaneDetectionNode(Node):
 
         white_cx = self._centroid_x(white_cnt)
 
-        # Reject white detections on the wrong side of the frame
         if white_cx is not None:
-            white_min_x = int(roi_w * self.get_parameter('white_x_min_ratio').value)
+            white_min_x = int(
+                roi_w * self.get_parameter('white_x_min_ratio').value
+            )
             if white_cx < white_min_x:
                 white_cx = None
                 white_cnt = None
+
         yellow_cx = self._centroid_x(yellow_cnt)
 
         now = self.get_clock().now().nanoseconds * 1e-9
         yellow_from_memory = False
+
         if yellow_cx is not None:
             self._last_yellow_cx = yellow_cx
             self._last_yellow_stamp = now
@@ -354,10 +385,14 @@ class LaneDetectionNode(Node):
             yellow_from_memory = True
 
         white_err = self._error_from_centroid(
-            white_cx, roi_w, self.get_parameter('target_white_x_ratio').value
+            white_cx,
+            roi_w,
+            self.get_parameter('target_white_x_ratio').value,
         )
         yellow_err = self._error_from_centroid(
-            yellow_cx, roi_w, self.get_parameter('target_yellow_x_ratio').value
+            yellow_cx,
+            roi_w,
+            self.get_parameter('target_yellow_x_ratio').value,
         )
 
         white_ok = white_cx is not None
@@ -401,7 +436,10 @@ class LaneDetectionNode(Node):
             target_h = raw_heading
             beta = float(self.get_parameter('heading_smoothing').value)
             beta = max(0.0, min(1.0, beta))
-        self._heading_smoothed = beta * self._heading_smoothed + (1.0 - beta) * target_h
+
+        self._heading_smoothed = (
+            beta * self._heading_smoothed + (1.0 - beta) * target_h
+        )
         heading = float(np.clip(self._heading_smoothed, -1.0, 1.0))
 
         alpha = float(self.get_parameter('confidence_smoothing').value)
@@ -414,11 +452,15 @@ class LaneDetectionNode(Node):
         orange_pixels = int(cv2.countNonZero(orange_mask))
         orange_wide_enough = False
         orange_largest = self._largest_contour(orange_mask)
+
         if orange_largest is not None:
-            x, _y, w_box, _h_box = cv2.boundingRect(orange_largest)
+            _x, _y, w_box, _h_box = cv2.boundingRect(orange_largest)
             min_w_ratio = self.get_parameter('min_orange_width_ratio').value
-            orange_wide_enough = w_box >= int(roi_w * min_w_ratio)
-            _ = x
+            orange_wide_enough = (
+                min_w_ratio == 0.0
+                or w_box >= int(roi_w * min_w_ratio)
+            )
+
         if (
             orange_pixels >= self.get_parameter('min_orange_pixels').value
             and orange_wide_enough
@@ -426,14 +468,19 @@ class LaneDetectionNode(Node):
             self._orange_streak += 1
         else:
             self._orange_streak = 0
+
         end_of_road = self._orange_streak >= self.get_parameter(
             'orange_consecutive_frames'
         ).value
+
+        partial_thr = self.get_parameter('min_orange_partial_pixels').value
+        orange_partial = orange_pixels >= partial_thr
 
         self.pub_error.publish(Float32(data=final_err))
         self.pub_heading.publish(Float32(data=heading))
         self.pub_conf.publish(Float32(data=confidence))
         self.pub_eor.publish(Bool(data=bool(end_of_road)))
+        self.pub_orange_partial.publish(Bool(data=bool(orange_partial)))
         self.pub_white_det.publish(Bool(data=bool(white_ok)))
 
         self._maybe_publish_points(
@@ -465,7 +512,8 @@ class LaneDetectionNode(Node):
         self.get_logger().info(
             f'src={src} err={final_err:+.2f} hdg={heading:+.2f} '
             f'conf={confidence:.2f} white={white_ok} yellow={yellow_any} '
-            f'orange_px={orange_pixels} eor={end_of_road}',
+            f'orange_px={orange_pixels} partial={orange_partial} '
+            f'eor={end_of_road}',
             throttle_duration_sec=1.0,
         )
 
@@ -488,6 +536,7 @@ class LaneDetectionNode(Node):
             get(f'{name}_s_max').value,
             get(f'{name}_v_max').value,
         ])
+
         mask = cv2.inRange(hsv, lo, hi)
         k = np.ones((kernel, kernel), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
@@ -495,50 +544,72 @@ class LaneDetectionNode(Node):
         return mask
 
     def _largest_contour(self, mask):
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         if not cnts:
             return None
+
         best = max(cnts, key=cv2.contourArea)
         if cv2.contourArea(best) < self.get_parameter('min_contour_area').value:
             return None
+
         return best
 
     @staticmethod
     def _centroid_x(cnt):
         if cnt is None:
             return None
+
         m = cv2.moments(cnt)
         if m['m00'] <= 0:
             return None
+
         return int(m['m10'] / m['m00'])
 
     def _yellow_heading(self, cnt):
         if cnt is None:
             self._last_yellow_line = None
             return None
+
         min_pts = int(self.get_parameter('heading_min_points').value)
         if len(cnt) < min_pts:
             self._last_yellow_line = None
             return None
+
         pts = cnt.reshape(-1, 2).astype(np.float32)
         line = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+
         vx, vy, x0, y0 = (
-            float(line[0]), float(line[1]), float(line[2]), float(line[3])
+            float(line[0]),
+            float(line[1]),
+            float(line[2]),
+            float(line[3]),
         )
+
         if vy < 0.0:
             vx, vy = -vx, -vy
+
         if vy < 0.05:
             self._last_yellow_line = None
             return None
+
         slope_per_depth = -vx / vy
         gain = float(self.get_parameter('heading_gain').value)
+        deadband = float(self.get_parameter('heading_deadband').value)
+
+        raw = slope_per_depth * gain
+        if abs(raw) < deadband:
+            raw = 0.0
+
         self._last_yellow_line = (vx, vy, x0, y0)
-        return float(max(-1.0, min(1.0, slope_per_depth * gain)))
+        return float(max(-1.0, min(1.0, raw)))
 
     @staticmethod
     def _error_from_centroid(cx, width, target_ratio):
         if cx is None:
             return 0.0
+
         target = width * target_ratio
         return float(target - cx) / float(width / 2.0)
 
@@ -547,15 +618,21 @@ class LaneDetectionNode(Node):
         if self.fx is None:
             return
 
-        n_white  = int(self.get_parameter('lane_sample_points_white').value)
+        n_white = int(self.get_parameter('lane_sample_points_white').value)
         n_yellow = int(self.get_parameter('lane_sample_points_yellow').value)
 
-        white_pix  = self._sample_contour(white_cnt,  roi_y_offset, n=n_white)  if white_cnt  is not None else []
-        yellow_pix = self._sample_contour(yellow_cnt, roi_y_offset, n=n_yellow) if yellow_cnt is not None else []
+        white_pix = (
+            self._sample_contour(white_cnt, roi_y_offset, n=n_white)
+            if white_cnt is not None else []
+        )
+        yellow_pix = (
+            self._sample_contour(yellow_cnt, roi_y_offset, n=n_yellow)
+            if yellow_cnt is not None else []
+        )
+
         if not white_pix and not yellow_pix:
             return
 
-        # Hardcoded mount geometry - verified working, camera does not move.
         h = 0.22
         pitch = math.radians(45.0)
         cam_x_offset = 0.10
@@ -569,58 +646,67 @@ class LaneDetectionNode(Node):
             for u, v in pixels:
                 x_norm = (u - self.cx_pix) / self.fx
                 y_norm = (v - self.cy_pix) / self.fy
-                ray_x =  cos_p + y_norm * sin_p
+
+                ray_x = cos_p + y_norm * sin_p
                 ray_y = -x_norm
                 ray_z = -sin_p + y_norm * cos_p
+
                 if ray_z >= -1e-6:
                     continue
+
                 scale = -h / ray_z
                 if scale <= 0.0:
                     continue
+
                 wx = cam_x_offset + scale * ray_x
                 wy = scale * ray_y
-                # Near-range only - kills far-field projection 'fog'.
+
                 if wx < 0.05 or wx > max_range:
                     continue
                 if abs(wy) > max_range:
                     continue
+
                 out.append((float(wx), float(wy), 0.0))
+
             return out
 
-        white_pts  = project(white_pix)
+        white_pts = project(white_pix)
         yellow_pts = project(yellow_pix)
 
         base = self.get_parameter('base_frame').value
+
         if white_pts:
-            self._publish_point_cloud_to(self.pub_points_white,  header, white_pts,  base)
+            self._publish_point_cloud_to(
+                self.pub_points_white,
+                header,
+                white_pts,
+                base,
+            )
         if yellow_pts:
-            self._publish_point_cloud_to(self.pub_points_yellow, header, yellow_pts, base)
+            self._publish_point_cloud_to(
+                self.pub_points_yellow,
+                header,
+                yellow_pts,
+                base,
+            )
         if white_pts or yellow_pts:
-            self._publish_point_cloud_to(self.pub_points, header, white_pts + yellow_pts, base)
+            self._publish_point_cloud_to(
+                self.pub_points,
+                header,
+                white_pts + yellow_pts,
+                base,
+            )
 
     @staticmethod
     def _sample_contour(cnt, roi_y_offset, n=6):
         step = max(1, len(cnt) // n)
         out = []
+
         for i in range(0, len(cnt), step):
             x, y = cnt[i][0]
             out.append((float(x), float(y + roi_y_offset)))
-        return out
 
-    @staticmethod
-    def _tf_to_matrix(tf):
-        t = tf.transform.translation
-        r = tf.transform.rotation
-        qx, qy, qz, qw = r.x, r.y, r.z, r.w
-        rot = np.array([
-            [1 - 2 * (qy ** 2 + qz ** 2), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
-            [2 * (qx * qy + qz * qw), 1 - 2 * (qx ** 2 + qz ** 2), 2 * (qy * qz - qx * qw)],
-            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx ** 2 + qy ** 2)],
-        ])
-        T = np.eye(4)
-        T[:3, :3] = rot
-        T[:3, 3] = [t.x, t.y, t.z]
-        return T
+        return out
 
     def _publish_point_cloud_to(self, publisher, header, points, frame_id):
         msg = PointCloud2()
@@ -629,9 +715,24 @@ class LaneDetectionNode(Node):
         msg.height = 1
         msg.width = len(points)
         msg.fields = [
-            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(
+                name='x',
+                offset=0,
+                datatype=PointField.FLOAT32,
+                count=1,
+            ),
+            PointField(
+                name='y',
+                offset=4,
+                datatype=PointField.FLOAT32,
+                count=1,
+            ),
+            PointField(
+                name='z',
+                offset=8,
+                datatype=PointField.FLOAT32,
+                count=1,
+            ),
         ]
         msg.is_bigendian = False
         msg.point_step = 12
@@ -663,23 +764,51 @@ class LaneDetectionNode(Node):
         vis[white_mask > 0] = (220, 220, 255)
         vis[yellow_mask > 0] = (0, 220, 220)
 
-        target_white = int(roi_w * self.get_parameter('target_white_x_ratio').value)
-        target_yellow = int(roi_w * self.get_parameter('target_yellow_x_ratio').value)
-        cv2.line(vis, (target_white, 0), (target_white, vis.shape[0]), (0, 255, 0), 1)
-        cv2.line(vis, (target_yellow, 0), (target_yellow, vis.shape[0]), (0, 180, 0), 1)
+        target_white = int(
+            roi_w * self.get_parameter('target_white_x_ratio').value
+        )
+        target_yellow = int(
+            roi_w * self.get_parameter('target_yellow_x_ratio').value
+        )
+
+        cv2.line(
+            vis,
+            (target_white, 0),
+            (target_white, vis.shape[0]),
+            (0, 255, 0),
+            1,
+        )
+        cv2.line(
+            vis,
+            (target_yellow, 0),
+            (target_yellow, vis.shape[0]),
+            (0, 180, 0),
+            1,
+        )
 
         if white_cx is not None:
             cv2.line(
-                vis, (white_cx, 0), (white_cx, vis.shape[0]),
-                (255, 255, 0), 3 if white_ok else 1,
+                vis,
+                (white_cx, 0),
+                (white_cx, vis.shape[0]),
+                (255, 255, 0),
+                3 if white_ok else 1,
             )
+
         if yellow_cx is not None:
             color = (180, 0, 180) if yellow_from_memory else (255, 0, 255)
-            cv2.line(vis, (yellow_cx, 0), (yellow_cx, vis.shape[0]), color, 2)
+            cv2.line(
+                vis,
+                (yellow_cx, 0),
+                (yellow_cx, vis.shape[0]),
+                color,
+                2,
+            )
 
         if self._last_yellow_line is not None:
             vx, vy, x0, y0 = self._last_yellow_line
             h = vis.shape[0]
+
             if abs(vy) > 1e-3:
                 t_top = (0 - y0) / vy
                 t_bot = (h - 1 - y0) / vy
@@ -690,28 +819,42 @@ class LaneDetectionNode(Node):
         bar_h = 8
         y0 = vis.shape[0] - bar_h - 2
         cv2.rectangle(vis, (0, y0), (roi_w - 1, y0 + bar_h), (40, 40, 40), -1)
+
         if confidence >= 0.7:
             bar_color = (0, 200, 0)
         elif confidence >= 0.4:
             bar_color = (0, 220, 220)
         else:
             bar_color = (0, 0, 220)
+
         bar_w = int(max(0.0, min(1.0, confidence)) * (roi_w - 1))
         cv2.rectangle(vis, (0, y0), (bar_w, y0 + bar_h), bar_color, -1)
 
         yolo_tag = ' [YOLO]' if (
-            self.get_parameter('use_yolo').value and self._yolo_model is not None
+            self.get_parameter('use_yolo').value
+            and self._yolo_model is not None
         ) else ''
+
         cv2.putText(
             vis,
-            f'src={src}{yolo_tag} err={final_err:+.2f} hdg={heading:+.2f} '
-            f'conf={confidence:.2f}',
-            (5, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA,
+            f'src={src}{yolo_tag} err={final_err:+.2f} '
+            f'hdg={heading:+.2f} conf={confidence:.2f}',
+            (5, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
         )
         cv2.putText(
-            vis, f'orange={orange_pixels}px  EOR={end_of_road}',
-            (5, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-            (0, 80, 255) if end_of_road else (180, 180, 180), 1, cv2.LINE_AA,
+            vis,
+            f'orange={orange_pixels}px  EOR={end_of_road}',
+            (5, 44),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 80, 255) if end_of_road else (180, 180, 180),
+            1,
+            cv2.LINE_AA,
         )
 
         out = self.bridge.cv2_to_imgmsg(vis, encoding='bgr8')

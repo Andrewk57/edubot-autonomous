@@ -11,6 +11,7 @@ Inputs
                                         in [-1, 1]; +ve = curve right ahead
 /lane/confidence     std_msgs/Float32   detection confidence in [0,1]
 /lane/end_of_road    std_msgs/Bool      orange perpendicular line in view
+/lane/orange_partial std_msgs/Bool      any orange pixels visible (pre-EOR)
 /lane/white_detected std_msgs/Bool      sanity flag - we have a right boundary
 /scan                sensor_msgs/LaserScan  forward LiDAR for obstacle stop
 /odom                nav_msgs/Odometry  used to close the loop on rotations
@@ -19,30 +20,6 @@ Outputs
 -------
 /cmd_vel             geometry_msgs/Twist
 /nav/state           std_msgs/String        current FSM state for debugging
-
-State machine
--------------
-DRIVING       - PD on lateral error; angular and linear limits scale with
-                detection confidence so a brief loss does not produce a
-                max-rate spin
-OBSTACLE      - LiDAR cone is occupied; hold zero velocity until clear
-U_TURN        - end-of-road triggered; 3-phase: rotate 90 deg CCW, creep
-                forward across the centre line, rotate 90 deg CCW again,
-                then -> RECOVERY
-INTERSECTION  - confidence collapsed while the robot was going straight ->
-                90 deg right turn (assignment rule), then -> RECOVERY
-RECOVERY      - slow forward creep with no PD until lane is reacquired or
-                a short timeout elapses; protects against snapping to
-                stale errors right after a turn
-SPIN_HOLD     - the PD asked for sustained near-saturation angular while
-                confidence was low; freeze velocity until confidence
-                recovers (hard backstop against the saturated-spin loop)
-LOST          - no error signal at all in a while; creep forward slowly so
-                we don't deadlock if a frame is dropped, but cap the
-                duration
-
-The PD gains, speeds, cone, and cooldown are all parameters so the demo can
-be tuned trackside without rebuilding.
 """
 import math
 
@@ -70,30 +47,16 @@ class NavigationNode(Node):
         # Safety
         self.declare_parameter('dry_run', True)
 
-        # PD controller. Kp lowered + Kd raised vs. original to reduce the
-        # snap-back oscillation seen at the track. kff is the feed-forward
-        # gain on /lane/heading - it lets the robot start turning into a
-        # curve based on yellow-line slope BEFORE the centroid has moved.
-        # kff defaults to 0 because at the track a small perspective bias
-        # in the slope fit was producing a sustained right-drift on
-        # straightaways. Bring it up live with `ros2 param set kff 0.2`
-        # while watching the curve behavior.
-        # kff_sharp_amp adds a non-linear amplification so sharp inside
-        # corners (heading near +/- 1.0) get a much stronger FF kick than
-        # gentle outside curves: effective_term = kff * h * (1 + amp*|h|).
-        # heading_slowdown drops linear speed in proportion to |heading|
-        # so the robot doesn't carry too much momentum into a 90 deg corner.
+        # PD controller
         self.declare_parameter('kp', 0.7)
         self.declare_parameter('kd', 0.55)
         self.declare_parameter('kff', 0.1)
-        self.declare_parameter('kff_sharp_amp', 1.0)
+        self.declare_parameter('kff_sharp_amp', 1.3)
         self.declare_parameter('heading_slowdown', 0.0)
         self.declare_parameter('max_angular', 1.4)
 
-        # Linear speed schedule. Lower max + steeper slowdown to keep the
-        # robot from carrying so much momentum into a curve that PD can't
-        # correct in time.
-        self.declare_parameter('max_linear', 0.10) #was working at .1
+        # Linear speed schedule
+        self.declare_parameter('max_linear', 0.10)
         self.declare_parameter('min_linear', 0.05)
         self.declare_parameter('linear_slowdown', 0.85)
 
@@ -103,38 +66,32 @@ class NavigationNode(Node):
         self.declare_parameter('obstacle_cone_deg', 20.0)
         self.declare_parameter('obstacle_min_range', 0.05)
 
-        # End-of-road / U-turn. 3-phase: two 90 deg CCW rotations with a
-        # forward creep between them. This keeps the manoeuvre within the
-        # road width and avoids the single large 180 rotation crossing back
-        # over the orange line.
+        # End-of-road / U-turn
         self.declare_parameter('u_turn_angular', 0.6)
         self.declare_parameter('u_turn_arrival_window_deg', 4.0)
-        self.declare_parameter('u_turn_fwd_secs', 3.0)   # time to creep across centre
-        self.declare_parameter('u_turn_timeout_s', 15.0)  # increased for 3-phase
+        self.declare_parameter('u_turn_fwd_secs', 4.0)
+        self.declare_parameter('u_turn_timeout_s', 15.0)
         self.declare_parameter('u_turn_cooldown_s', 6.0)
 
-        # Intersection right-turn (assignment rule: turn right by default).
-        # Negative target means clockwise; magnitude is 90 deg. Detection
-        # window reduced from 1.5 s to 0.8 s so the robot triggers before
-        # it has driven too far past the junction.
+        # Intersection right-turn
         self.declare_parameter('intersection_target_deg', -90.0)
         self.declare_parameter('intersection_angular', 0.6)
         self.declare_parameter('intersection_timeout_s', 6.0)
         self.declare_parameter('intersection_cooldown_s', 8.0)
-        self.declare_parameter('intersection_detect_secs', 0.8)
+        self.declare_parameter('intersection_detect_secs', 1.2)
         self.declare_parameter('intersection_low_conf_threshold', 0.15)
         self.declare_parameter('intersection_steady_err_threshold', 0.25)
 
-        # Confidence-aware control.
+        # Confidence-aware control
         self.declare_parameter('low_conf_min_scale', 0.2)
         self.declare_parameter('steady_err_alpha', 0.2)
 
-        # Spin-out guard.
+        # Spin-out guard
         self.declare_parameter('spin_out_secs', 1.2)
         self.declare_parameter('spin_out_low_conf', 0.4)
         self.declare_parameter('spin_out_recover_conf', 0.5)
 
-        # Recovery (after U_TURN or INTERSECTION).
+        # Recovery
         self.declare_parameter('recovery_creep', 0.05)
         self.declare_parameter('recovery_max_secs', 4.0)
         self.declare_parameter('recovery_required_frames', 8)
@@ -159,13 +116,14 @@ class NavigationNode(Node):
 
         self._white_detected = False
         self._end_of_road = False
+        self._orange_partial = False
         self._scan = None
         self._yaw = None
 
         self._state = DRIVING
         self._u_turn_start_yaw = None
         self._u_turn_started_at = None
-        self._u_turn_phase = 0            # 0=first 90, 1=forward, 2=second 90
+        self._u_turn_phase = 0
         self._u_turn_fwd_started_at = None
         self._u_turn_phase2_started_at = None
         self._u_turn_cooldown_until = 0.0
@@ -187,6 +145,7 @@ class NavigationNode(Node):
         self.create_subscription(Float32, '/lane/heading', self._heading_cb, 10)
         self.create_subscription(Float32, '/lane/confidence', self._conf_cb, 10)
         self.create_subscription(Bool, '/lane/end_of_road', self._eor_cb, 10)
+        self.create_subscription(Bool, '/lane/orange_partial', self._orange_partial_cb, 10)
         self.create_subscription(Bool, '/lane/white_detected', self._white_cb, 10)
         self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
         self.create_subscription(Odometry, '/odom', self._odom_cb, 20)
@@ -223,6 +182,9 @@ class NavigationNode(Node):
 
     def _eor_cb(self, msg: Bool):
         self._end_of_road = bool(msg.data)
+
+    def _orange_partial_cb(self, msg: Bool):
+        self._orange_partial = bool(msg.data)
 
     def _white_cb(self, msg: Bool):
         self._white_detected = bool(msg.data)
@@ -309,7 +271,8 @@ class NavigationNode(Node):
                 self.get_logger().info('Path clear -> resuming')
                 self._state = DRIVING
 
-        # 2. End-of-road -> U_TURN (with cooldown so we don't loop)
+        # 2. End-of-road -> U_TURN.
+        # This intentionally comes before intersection logic.
         if (
             self._state == DRIVING
             and self._end_of_road
@@ -322,41 +285,48 @@ class NavigationNode(Node):
             self._u_turn_phase = 0
             self._u_turn_fwd_started_at = None
             self._u_turn_phase2_started_at = None
+            self._low_conf_since = None
 
-        # 3. Intersection detection. Only fire when we were going straight
-        # (low steady-state error) and confidence has been near zero for
-        # long enough that this is a structural lane loss, not a single
-        # bad frame on a curve. Detection window is 0.8 s (was 1.5 s) so
-        # the robot triggers before it has passed the junction.
+        # 3. Intersection detection.
+        # IMPORTANT FIX:
+        # If orange is visible at all, reset the intersection timer.
+        # This prevents the robot from treating the U-turn marker as an intersection
+        # during the moment when lane confidence drops.
         if self._state == DRIVING:
-            low_conf_thr = self.get_parameter(
-                'intersection_low_conf_threshold'
-            ).value
-            if self._confidence < low_conf_thr:
-                if self._low_conf_since is None:
-                    self._low_conf_since = now
-                detect_secs = self.get_parameter(
-                    'intersection_detect_secs'
-                ).value
-                steady_thr = self.get_parameter(
-                    'intersection_steady_err_threshold'
-                ).value
-                if (
-                    now - self._low_conf_since >= detect_secs
-                    and self._steady_err_ema < steady_thr
-                    and now > self._intersection_cooldown_until
-                    and now > self._u_turn_cooldown_until
-                ):
-                    self.get_logger().info(
-                        f'Intersection (conf<{low_conf_thr:.2f} for '
-                        f'{now - self._low_conf_since:.2f}s, steady_err='
-                        f'{self._steady_err_ema:.2f}) -> right turn'
-                    )
-                    self._enter_intersection()
-            else:
+            if self._orange_partial or self._end_of_road:
                 self._low_conf_since = None
+            else:
+                low_conf_thr = self.get_parameter(
+                    'intersection_low_conf_threshold'
+                ).value
 
-        # 4. Run the active state
+                if self._confidence < low_conf_thr:
+                    if self._low_conf_since is None:
+                        self._low_conf_since = now
+
+                    detect_secs = self.get_parameter(
+                        'intersection_detect_secs'
+                    ).value
+                    steady_thr = self.get_parameter(
+                        'intersection_steady_err_threshold'
+                    ).value
+
+                    if (
+                        now - self._low_conf_since >= detect_secs
+                        and self._steady_err_ema < steady_thr
+                        and now > self._intersection_cooldown_until
+                        and now > self._u_turn_cooldown_until
+                    ):
+                        self.get_logger().info(
+                            f'Intersection (conf<{low_conf_thr:.2f} for '
+                            f'{now - self._low_conf_since:.2f}s, steady_err='
+                            f'{self._steady_err_ema:.2f}) -> right turn'
+                        )
+                        self._enter_intersection()
+                else:
+                    self._low_conf_since = None
+
+        # 4. Run the active state.
         if self._state == OBSTACLE:
             self._publish_cmd(0.0, 0.0)
         elif self._state == U_TURN:
@@ -369,7 +339,7 @@ class NavigationNode(Node):
             self._run_spin_hold()
         elif self._state == LOST:
             self._run_lost()
-        else:  # DRIVING
+        else:
             self._run_driving()
 
         self._publish_state()
@@ -441,6 +411,7 @@ class NavigationNode(Node):
             sign_ang = 1
         elif raw_ang < -spin_thresh:
             sign_ang = -1
+
         if sign_ang != 0:
             if self._high_ang_dir != sign_ang:
                 self._high_ang_dir = sign_ang
@@ -486,7 +457,6 @@ class NavigationNode(Node):
             return
 
         if self._u_turn_phase == 0:
-            # First 90 deg CCW rotation
             completed = False
             if self._yaw is not None and self._u_turn_start_yaw is not None:
                 turned = abs(self._angle_diff(self._yaw, self._u_turn_start_yaw))
@@ -497,23 +467,25 @@ class NavigationNode(Node):
             if completed:
                 self._u_turn_phase = 1
                 self._u_turn_fwd_started_at = now
-                self.get_logger().info('U-turn phase 0 (first 90 deg) done -> creeping forward')
+                self.get_logger().info(
+                    'U-turn phase 0 done -> creeping forward'
+                )
             else:
                 self._publish_cmd(0.0, omega)
 
         elif self._u_turn_phase == 1:
-            # Creep forward across the centre line
             fwd_elapsed = now - (self._u_turn_fwd_started_at or now)
             if fwd_elapsed >= fwd_secs:
                 self._u_turn_phase = 2
-                self._u_turn_start_yaw = self._yaw  # reset yaw ref for second turn
+                self._u_turn_start_yaw = self._yaw
                 self._u_turn_phase2_started_at = now
-                self.get_logger().info('U-turn phase 1 (forward) done -> second 90 deg')
+                self.get_logger().info(
+                    'U-turn phase 1 done -> second 90 deg'
+                )
             else:
                 self._publish_cmd(creep, 0.0)
 
         else:
-            # Second 90 deg CCW rotation
             completed = False
             if self._yaw is not None and self._u_turn_start_yaw is not None:
                 turned = abs(self._angle_diff(self._yaw, self._u_turn_start_yaw))
@@ -528,17 +500,18 @@ class NavigationNode(Node):
                 self._publish_cmd(0.0, omega)
 
     def _finish_u_turn(self, now):
-        self._u_turn_cooldown_until = now + self.get_parameter('u_turn_cooldown_s').value
+        self._u_turn_cooldown_until = now + self.get_parameter(
+            'u_turn_cooldown_s'
+        ).value
         self._u_turn_start_yaw = None
         self._u_turn_started_at = None
         self._u_turn_phase = 0
         self._u_turn_fwd_started_at = None
         self._u_turn_phase2_started_at = None
+        self._low_conf_since = None
         self._enter_recovery('U-turn complete')
 
     def _run_intersection(self):
-        # 90 deg right turn (signed cumulative yaw so the +/- pi wrap doesn't
-        # confuse arrival detection). target_deg is signed: -90 = right.
         target = math.radians(self.get_parameter('intersection_target_deg').value)
         omega_mag = self.get_parameter('intersection_angular').value
         direction = -1.0 if target < 0 else 1.0
@@ -580,6 +553,7 @@ class NavigationNode(Node):
             self._intersection_started_at = None
             self._intersection_last_yaw = None
             self._intersection_accum_yaw = 0.0
+            self._low_conf_since = None
             self._enter_recovery('Intersection turn complete')
             return
 
@@ -592,6 +566,7 @@ class NavigationNode(Node):
         self._last_error_time = None
         self._high_ang_dir = 0
         self._high_ang_since = None
+        self._low_conf_since = None
         self._publish_cmd(0.0, 0.0)
         self.get_logger().info(f'{why} -> RECOVERY')
 

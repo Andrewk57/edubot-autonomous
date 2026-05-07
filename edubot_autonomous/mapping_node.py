@@ -13,14 +13,27 @@ Subscribes (any of the three; /lane/points alone still works):
   /lane/points          - combined (no class info, treated as 'white')
   /lane/points/white    - white solid line
   /lane/points/yellow   - yellow dashed line
+
+FIXES applied:
+  - TF lookup now uses msg.header.stamp instead of latest-available, which
+    eliminates smearing during rotations.
+  - Subscribes to /odom and rejects point clouds when |angular.z| is above
+    a threshold (robot spinning -> projection is unreliable).
+  - Subscribes to /lane/confidence and rejects clouds below a threshold
+    so low-quality detections don't pollute the map.
 """
 
+import math
 import struct
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
+from rclpy.duration import Duration
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2, PointField
+from std_msgs.msg import Float32
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from std_msgs.msg import ColorRGBA
@@ -44,6 +57,10 @@ class MappingNode(Node):
         self.declare_parameter('grid_resolution_m', 0.05)
         self.declare_parameter('marker_cube_size', 0.07)
 
+        # --- NEW: spin rejection & confidence gating params ---
+        self.declare_parameter('max_angular_for_mapping', 0.5)   # rad/s - skip clouds above this
+        self.declare_parameter('min_confidence_for_mapping', 0.6) # skip clouds below this
+
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
@@ -52,6 +69,13 @@ class MappingNode(Node):
         self._white_order: list = []
         self._yellow_map: dict = {}
         self._yellow_order: list = []
+
+        # --- NEW: track current angular velocity and confidence ---
+        self._current_angular_z = 0.0
+        self._current_confidence = 0.0
+
+        self.create_subscription(Odometry, '/odom', self._odom_cb, 20)
+        self.create_subscription(Float32, '/lane/confidence', self._conf_cb, 10)
 
         self.create_subscription(PointCloud2, '/lane/points',
                                  lambda m: self._lane_cb(m, 'white'), 10)
@@ -72,16 +96,43 @@ class MappingNode(Node):
             'waiting on /map TF.'
         )
 
+    # --- NEW callbacks for gating ---
+    def _odom_cb(self, msg: Odometry):
+        self._current_angular_z = msg.twist.twist.angular.z
+
+    def _conf_cb(self, msg: Float32):
+        self._current_confidence = float(msg.data)
+
     # ----------------------------------------------------------- ingest
     def _lane_cb(self, msg: PointCloud2, cls: str):
+        # --- NEW: reject clouds when robot is spinning fast ---
+        max_ang = float(self.get_parameter('max_angular_for_mapping').value)
+        if abs(self._current_angular_z) > max_ang:
+            self.get_logger().debug(
+                f'Skipping cloud: angular_z={self._current_angular_z:.2f} > {max_ang}',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        # --- NEW: reject clouds when detection confidence is low ---
+        min_conf = float(self.get_parameter('min_confidence_for_mapping').value)
+        if self._current_confidence < min_conf:
+            return
+
         map_frame  = self.get_parameter('map_frame').value
         base_frame = self.get_parameter('base_frame').value
 
+        # --- FIX: use the message timestamp, not latest-available TF ---
+        # This prevents smearing points around the robot's arc during turns.
+        stamp = Time.from_msg(msg.header.stamp)
         try:
-            tf = self.tf_buffer.lookup_transform(map_frame, base_frame, rclpy.time.Time())
+            tf = self.tf_buffer.lookup_transform(
+                map_frame, base_frame, stamp,
+                timeout=Duration(seconds=0.1),
+            )
         except TransformException:
             self.get_logger().warn(
-                f'TF not available: {base_frame} -> {map_frame}. SLAM running?',
+                f'TF not available at stamp for {base_frame} -> {map_frame}. SLAM running?',
                 throttle_duration_sec=5.0,
             )
             return
