@@ -38,6 +38,7 @@ INTERSECTION = 'INTERSECTION'
 RECOVERY = 'RECOVERY'
 SPIN_HOLD = 'SPIN_HOLD'
 LOST = 'LOST'
+STOP_SIGN = 'STOP_SIGN'
 
 
 class NavigationNode(Node):
@@ -59,6 +60,10 @@ class NavigationNode(Node):
         self.declare_parameter('max_linear', 0.10)
         self.declare_parameter('min_linear', 0.05)
         self.declare_parameter('linear_slowdown', 0.85)
+
+        # Stop sign handling
+        self.declare_parameter('stop_sign_stop_secs', 5.0)
+        self.declare_parameter('stop_sign_cooldown_s', 10.0)
 
         # Obstacle handling
         self.declare_parameter('obstacle_stop_m', 0.40)
@@ -117,6 +122,7 @@ class NavigationNode(Node):
         self._white_detected = False
         self._end_of_road = False
         self._orange_partial = False
+        self._stop_sign = False
         self._scan = None
         self._yaw = None
 
@@ -128,6 +134,8 @@ class NavigationNode(Node):
         self._u_turn_phase2_started_at = None
         self._u_turn_cooldown_until = 0.0
         self._lost_since = None
+        self._stop_started_at = None
+        self._stop_sign_cooldown_until = 0.0
 
         self._intersection_started_at = None
         self._intersection_last_yaw = None
@@ -147,6 +155,7 @@ class NavigationNode(Node):
         self.create_subscription(Bool, '/lane/end_of_road', self._eor_cb, 10)
         self.create_subscription(Bool, '/lane/orange_partial', self._orange_partial_cb, 10)
         self.create_subscription(Bool, '/lane/white_detected', self._white_cb, 10)
+        self.create_subscription(Bool, '/lane/stop_sign', self._stop_sign_cb, 10)
         self.create_subscription(LaserScan, '/scan', self._scan_cb, 10)
         self.create_subscription(Odometry, '/odom', self._odom_cb, 20)
 
@@ -188,6 +197,9 @@ class NavigationNode(Node):
 
     def _white_cb(self, msg: Bool):
         self._white_detected = bool(msg.data)
+
+    def _stop_sign_cb(self, msg: Bool):
+        self._stop_sign = bool(msg.data)
 
     def _scan_cb(self, msg: LaserScan):
         self._scan = msg
@@ -271,7 +283,18 @@ class NavigationNode(Node):
                 self.get_logger().info('Path clear -> resuming')
                 self._state = DRIVING
 
-        # 2. End-of-road -> U_TURN.
+        # 2. Stop sign override. Stop once, wait 5 seconds, then continue.
+        if (
+            self._state == DRIVING
+            and self._stop_sign
+            and now > self._stop_sign_cooldown_until
+        ):
+            self.get_logger().info('Stop sign detected -> stopping for 5 seconds')
+            self._state = STOP_SIGN
+            self._stop_started_at = now
+            self._low_conf_since = None
+
+        # 3. End-of-road -> U_TURN.
         # This intentionally comes before intersection logic.
         if (
             self._state == DRIVING
@@ -287,7 +310,7 @@ class NavigationNode(Node):
             self._u_turn_phase2_started_at = None
             self._low_conf_since = None
 
-        # 3. Intersection detection.
+        # 4. Intersection detection.
         # IMPORTANT FIX:
         # If orange is visible at all, reset the intersection timer.
         # This prevents the robot from treating the U-turn marker as an intersection
@@ -326,9 +349,11 @@ class NavigationNode(Node):
                 else:
                     self._low_conf_since = None
 
-        # 4. Run the active state.
+        # 5. Run the active state.
         if self._state == OBSTACLE:
             self._publish_cmd(0.0, 0.0)
+        elif self._state == STOP_SIGN:
+            self._run_stop_sign()
         elif self._state == U_TURN:
             self._run_u_turn()
         elif self._state == INTERSECTION:
@@ -343,6 +368,29 @@ class NavigationNode(Node):
             self._run_driving()
 
         self._publish_state()
+
+
+    def _run_stop_sign(self):
+        now = self._now()
+        stop_secs = self.get_parameter('stop_sign_stop_secs').value
+
+        if self._stop_started_at is None:
+            self._stop_started_at = now
+
+        elapsed = now - self._stop_started_at
+
+        if elapsed >= stop_secs:
+            self.get_logger().info('Stop sign complete -> DRIVING')
+            self._state = DRIVING
+            self._stop_started_at = None
+            self._stop_sign_cooldown_until = now + self.get_parameter(
+                'stop_sign_cooldown_s'
+            ).value
+            self._last_error_time = None
+            self._low_conf_since = None
+            return
+
+        self._publish_cmd(0.0, 0.0)
 
     def _enter_intersection(self):
         self._state = INTERSECTION

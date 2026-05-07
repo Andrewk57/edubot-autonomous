@@ -15,6 +15,8 @@ Outputs:
   /lane/end_of_road    std_msgs/Bool
   /lane/orange_partial std_msgs/Bool
   /lane/white_detected std_msgs/Bool
+  /lane/stop_sign      std_msgs/Bool
+  /lane/lane_mask_image sensor_msgs/Image     mono8: 0=background, 100=white, 200=yellow
   /lane/debug_image    sensor_msgs/Image
   /lane/points         sensor_msgs/PointCloud2
 """
@@ -60,7 +62,10 @@ class LaneDetectionNode(Node):
         self.declare_parameter('white_s_max', 40)
         self.declare_parameter('white_v_min', 200)
         self.declare_parameter('white_v_max', 255)
-
+        # Red stop sign HSV gates
+        self.declare_parameter('red_s_min', 100)
+        self.declare_parameter('red_v_min', 80)
+        self.declare_parameter('min_red_pixels', 6500)
         self.declare_parameter('yellow_h_min', 20)
         self.declare_parameter('yellow_h_max', 45)
         self.declare_parameter('yellow_s_min', 80)
@@ -161,6 +166,8 @@ class LaneDetectionNode(Node):
         self.pub_orange_partial = self.create_publisher(
             Bool, '/lane/orange_partial', 10
         )
+        self.pub_stop_sign = self.create_publisher(Bool, '/lane/stop_sign', 10)
+        self.pub_lane_mask = self.create_publisher(Image, '/lane/lane_mask_image', 10)
         self.pub_white_det = self.create_publisher(
             Bool, '/lane/white_detected', 10
         )
@@ -321,6 +328,10 @@ class LaneDetectionNode(Node):
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         hsv_orange = cv2.cvtColor(roi_orange, cv2.COLOR_BGR2HSV)
 
+        red_mask = self._red_mask(hsv, kernel=5)
+        red_pixels = int(cv2.countNonZero(red_mask))
+        stop_sign = red_pixels >= self.get_parameter('min_red_pixels').value
+
         if self.get_parameter('use_yolo').value and self._yolo_model is not None:
             self._yolo_frame_count += 1
             skip = int(self.get_parameter('yolo_frame_skip').value)
@@ -352,6 +363,20 @@ class LaneDetectionNode(Node):
         else:
             white_mask = self._color_mask(hsv, 'white', kernel=5)
             yellow_mask = self._color_mask(hsv, 'yellow', kernel=5)
+
+        # Publish a lightweight lane-only mask for mapping.
+        # This lets mapping subscribe to processed lane pixels instead of
+        # subscribing to camera_2 or rerunning YOLO.
+        # Pixel values:
+        #   0   = background
+        #   100 = white lane
+        #   200 = yellow lane
+        lane_mask = np.zeros_like(white_mask, dtype=np.uint8)
+        lane_mask[white_mask > 0] = 100
+        lane_mask[yellow_mask > 0] = 200
+        lane_mask_msg = self.bridge.cv2_to_imgmsg(lane_mask, encoding='mono8')
+        lane_mask_msg.header = msg.header
+        self.pub_lane_mask.publish(lane_mask_msg)
 
         orange_mask = self._color_mask(hsv_orange, 'orange', kernel=7)
 
@@ -482,6 +507,7 @@ class LaneDetectionNode(Node):
         self.pub_eor.publish(Bool(data=bool(end_of_road)))
         self.pub_orange_partial.publish(Bool(data=bool(orange_partial)))
         self.pub_white_det.publish(Bool(data=bool(white_ok)))
+        self.pub_stop_sign.publish(Bool(data=bool(stop_sign)))
 
         self._maybe_publish_points(
             msg.header,
@@ -513,7 +539,7 @@ class LaneDetectionNode(Node):
             f'src={src} err={final_err:+.2f} hdg={heading:+.2f} '
             f'conf={confidence:.2f} white={white_ok} yellow={yellow_any} '
             f'orange_px={orange_pixels} partial={orange_partial} '
-            f'eor={end_of_road}',
+            f'eor={end_of_road} red_px={red_pixels} stop={stop_sign}',
             throttle_duration_sec=1.0,
         )
 
@@ -538,6 +564,26 @@ class LaneDetectionNode(Node):
         ])
 
         mask = cv2.inRange(hsv, lo, hi)
+        k = np.ones((kernel, kernel), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        return mask
+
+
+    def _red_mask(self, hsv, kernel=5):
+        # Red wraps around the HSV hue range, so combine low-red and high-red.
+        s_min = self.get_parameter('red_s_min').value
+        v_min = self.get_parameter('red_v_min').value
+
+        lower_red1 = np.array([0, s_min, v_min])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([170, s_min, v_min])
+        upper_red2 = np.array([179, 255, 255])
+
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        mask = cv2.bitwise_or(mask1, mask2)
+
         k = np.ones((kernel, kernel), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
