@@ -69,7 +69,7 @@ class NavigationNode(Node):
         # End-of-road / U-turn
         self.declare_parameter('u_turn_angular', 0.6)
         self.declare_parameter('u_turn_arrival_window_deg', 4.0)
-        self.declare_parameter('u_turn_fwd_secs', 4.0)
+        self.declare_parameter('u_turn_fwd_secs', 5.0)
         self.declare_parameter('u_turn_timeout_s', 15.0)
         self.declare_parameter('u_turn_cooldown_s', 6.0)
 
@@ -92,7 +92,7 @@ class NavigationNode(Node):
         self.declare_parameter('spin_out_recover_conf', 0.5)
 
         # Recovery
-        self.declare_parameter('recovery_creep', 0.05)
+        self.declare_parameter('recovery_creep', 0.08)
         self.declare_parameter('recovery_max_secs', 4.0)
         self.declare_parameter('recovery_required_frames', 8)
         self.declare_parameter('recovery_conf_threshold', 0.6)
